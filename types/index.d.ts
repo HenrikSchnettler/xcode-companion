@@ -34,8 +34,6 @@ export type Setup = {
   projects: readonly string[]
   /** The approval dialog was asked for and not yet answered. */
   isApprovalAsked: boolean
-  /** The backend picked before, shown when picking again (`/xcode-backend`). */
-  backend?: Backend | null
 }
 
 /** The project the band works on, as Xcode's MCP server opened it. */

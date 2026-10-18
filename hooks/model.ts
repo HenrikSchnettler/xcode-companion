@@ -4,7 +4,7 @@
 // controls exist in which situation lives here, so the rules are in one place
 // and testable without an engine.
 
-import type { Activity, ActivityKind, Actor, Backend, Destination, Elsewhere, Launched, Outcome, RunPhase, Setup } from '../types'
+import type { Activity, ActivityKind, Actor, Destination, Elsewhere, Launched, Outcome, RunPhase, Setup } from '../types'
 
 // ── Reading Xcode's MCP answers ─────────────────────────────────────────────
 
@@ -355,8 +355,6 @@ export const ACTION_LABEL: Record<Action, string> = {
   'open-in-xcode': 'Open in Xcode',
 }
 
-export const BACKEND_LABEL: Record<Backend, string> = { 'xcode-mcp': 'Xcode MCP' }
-
 export const SELECT_COMMAND = 'sudo xcode-select -s /Applications/Xcode.app'
 export const ENABLE_COMMAND = 'sudo xcrun mcp-server enable'
 
@@ -471,19 +469,12 @@ const setupView = (s: Setup, project: string | null): BandView => {
     case 'no-project':
       return view('No Xcode project here', null, [], 'calm')
     case 'choose-backend':
-      return s.backend
-        ? view(
-            `Pick what builds ${project ?? 'the project'}`,
-            `Now: ${BACKEND_LABEL[s.backend]} · the band builds, runs and tests through it · more backends to come`,
-            ['use-xcode-mcp'],
-            'calm',
-          )
-        : view(
-            `${project ?? 'Xcode project'} found · pick what builds it`,
-            'The band builds, runs and tests through it · more backends later',
-            ['use-xcode-mcp'],
-            'calm',
-          )
+      return view(
+        `${project ?? 'Xcode project'} found · pick what builds it`,
+        'The band builds, runs and tests through it · more backends later',
+        ['use-xcode-mcp'],
+        'calm',
+      )
     case 'pick-project':
       return { ...view('Several Xcode projects here · pick one', null, [], 'calm'), hasProjectPicker: true }
     case 'no-xcode':

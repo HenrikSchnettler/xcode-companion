@@ -5,7 +5,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
-import { bandView, outcomeOf, readAnswer } from '../hooks/model'
+import { outcomeOf, readAnswer } from '../hooks/model'
 
 const T0 = 1_800_000_000_000
 const SURFACES = ['terminal', 'desktop'] as const
@@ -903,29 +903,6 @@ test("the project's window in the Xcode app reads as such", async ($, on) => {
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: 'Xcode window' })).toBeDefined()
   await ui.unmount()
-})
-
-test('picking the backend again names the current one', () => {
-  const view = bandView({
-    setup: { step: 'choose-backend', message: null, xcodeVersion: '27.0', isHeadlessCapable: true, isXcodeOpen: false, projects: [PROJECT], isApprovalAsked: false, backend: 'xcode-mcp' },
-    project: 'App',
-    scheme: null,
-    active: null,
-    activities: [],
-    isExternalBuild: false,
-    launched: null,
-    last: null,
-    isTurn: false,
-    elsewhere: [],
-    projectPath: PROJECT,
-    isPaused: false,
-    via: null,
-    now: 0,
-    spinner: '',
-  })
-  expect(view.headline).toBe('Pick what builds App')
-  expect(view.detail).toMatch(/^Now: Xcode MCP/)
-  expect(view.actions).toEqual(['use-xcode-mcp'])
 })
 
 test('Open in Xcode opens the project in the Xcode app', async ($, on) => {

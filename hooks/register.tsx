@@ -484,8 +484,7 @@ const probe = async ($: EngineInterface) => {
     if (projects.length === 0) return void (await setStep($, 'no-project', { projects }))
 
     const backend = (await $.store.get('backend')) as Backend | undefined
-    if (backend === undefined) return void (await setStep($, 'choose-backend', { projects, backend: null }))
-    await update($, setup, (s: Setup) => ({ ...s, backend }))
+    if (backend === undefined) return void (await setStep($, 'choose-backend', { projects }))
 
     const chosen = (await $.store.get(keyFor('project', cwd))) as string | undefined
     const path = projects.length === 1 ? projects[0] : projects.find(p => p === chosen)
@@ -898,9 +897,8 @@ const isEmptyBox = (tree: unknown): boolean => {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'xcode-band', description: 'Show or hide the Xcode Companion band above the prompt' })
-    await $.command.register({ name: 'xcode-setup', description: 'Walk through the Xcode Companion setup again' })
-    await $.command.register({ name: 'xcode-backend', description: 'Pick what Xcode Companion builds with' })
+    await $.command.register({ name: 'xcode-companion-band', description: 'Show or hide the Xcode Companion band above the prompt' })
+    await $.command.register({ name: 'xcode-companion-setup', description: 'Walk through the Xcode Companion setup again' })
     // A tool the band can do without: its refusal never keeps the band from starting.
     await $.tool
       .register({
@@ -940,7 +938,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'xcode-band' }, async $ => {
+  on('command.run', { command: 'xcode-companion-band' }, async $ => {
     await touch($)
     const hidden = !(await read($, isHidden))
     await update($, isHidden, () => hidden)
@@ -948,18 +946,7 @@ export const register: Register = on => {
     return { text: hidden ? 'Xcode band hidden.' : 'Xcode band shown.' }
   })
 
-  // Picks the backend again, the rest of the setup (project, approval) kept:
-  // the band shows the choice with the current one named until one is pressed.
-  on('command.run', { command: 'xcode-backend' }, async $ => {
-    await touch($)
-    const backend = ((await $.store.get('backend')) as Backend | undefined) ?? null
-    await update($, isHidden, () => false)
-    await setStep($, 'choose-backend', { backend })
-
-    return { text: 'Pick a backend in the band.' }
-  })
-
-  on('command.run', { command: 'xcode-setup' }, async $ => {
+  on('command.run', { command: 'xcode-companion-setup' }, async $ => {
     await $.store.delete('backend')
     const cwd = await $.session.cwd()
     await $.store.delete(keyFor('project', cwd))

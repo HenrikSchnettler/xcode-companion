@@ -40,9 +40,9 @@ over the project.
   needing to be open (26.3), the approval dialog in Xcode, the project to open.
 - **`band_state` tool** — Claude can read the band's state (setup step, device,
   what builds, the last result).
-- **Commands** — `/xcode-band` shows or hides the band, `/xcode-setup`
-  walks through the setup again, `/xcode-backend` picks the build backend
-  again (only Xcode's MCP server today).
+- **Commands** — `/xcode-companion-band` shows or hides the band,
+  `/xcode-companion-setup` walks through the setup again (the build backend
+  included: only Xcode's MCP server today).
 
 Outside an Xcode project the band stays out of the way entirely.
 
