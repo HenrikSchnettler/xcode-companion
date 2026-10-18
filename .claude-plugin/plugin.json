@@ -1,0 +1,29 @@
+{
+  "name": "xcode-companion",
+  "version": "0.1.0",
+  "description": "Xcode in Claude Code: a band above the prompt to build, run and test on a device or simulator, see when Claude, Xcode or another session is building, and get set up step by step, through Xcode's own MCP server.",
+  "author": {
+    "name": "Henrik Schnettler"
+  },
+  "homepage": "https://github.com/HenrikSchnettler/xcode-companion",
+  "repository": "https://github.com/HenrikSchnettler/xcode-companion",
+  "license": "MIT",
+  "keywords": [
+    "xcode",
+    "ios",
+    "build",
+    "run",
+    "test",
+    "simulator",
+    "mcp"
+  ],
+  "types": "./types/index.d.ts",
+  "mcpServers": {
+    "xcode": {
+      "command": "xcrun",
+      "args": [
+        "mcpbridge"
+      ]
+    }
+  }
+}

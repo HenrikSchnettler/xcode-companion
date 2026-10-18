@@ -1,0 +1,13 @@
+{
+  "name": "xcode-companion",
+  "description": "Xcode Companion: build, run and test Xcode projects from a band above the Claude Code prompt.",
+  "owner": {
+    "name": "Henrik Schnettler"
+  },
+  "plugins": [
+    {
+      "name": "xcode-companion",
+      "source": "./"
+    }
+  ]
+}
