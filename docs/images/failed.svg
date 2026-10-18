@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="109" viewBox="0 0 1040 109" font-family="-apple-system, BlinkMacSystemFont, &#x27;SF Pro Text&#x27;, &#x27;Helvetica Neue&#x27;, Arial, sans-serif">
+<rect x="0.5" y="0.5" width="1039" height="108" rx="14" fill="#1e1e1e" stroke="#2e2e2e"/>
+<text x="22" y="38.0" font-size="13" fill="#e57b74">⚒</text>
+<text x="48" y="38.0" font-size="17" fill="#e57b74">Build failed · 2 errors</text>
+<text x="48" y="60.8" font-size="15" fill="#8f8f8f">MyApp · from the band 1m ago</text>
+<text x="48" y="82.8" font-size="15" fill="#8f8f8f">Xcode window</text>
+<rect x="884.5" y="37.5" width="133.5" height="34" rx="9" fill="#3a3a3a"/>
+<text x="951.2" y="59.5" font-size="15" fill="#f2f2f2" text-anchor="middle">Open in Xcode</text>
+<rect x="811.5" y="37.5" width="63.0" height="34" rx="9" fill="#3a3a3a"/>
+<text x="843.0" y="59.5" font-size="15" fill="#f2f2f2" text-anchor="middle">Test</text>
+<rect x="737.8" y="37.5" width="63.8" height="34" rx="9" fill="#3a3a3a"/>
+<text x="769.6" y="59.5" font-size="15" fill="#f2f2f2" text-anchor="middle">Build</text>
+<rect x="673.0" y="37.5" width="54.8" height="34" rx="9" fill="#3a3a3a"/>
+<text x="700.4" y="59.5" font-size="15" fill="#f2f2f2" text-anchor="middle">Run</text>
+<rect x="500.2" y="37.5" width="162.8" height="34" rx="9" fill="#3a3a3a"/>
+<text x="581.6" y="59.5" font-size="15" fill="#f2f2f2" text-anchor="middle">Ask Claude to fix</text>
+<rect x="334.8" y="37.5" width="155.5" height="34" rx="9" fill="#3a3a3a"/>
+<text x="348.8" y="59.5" font-size="15" fill="#f2f2f2">iPhone 17 Pro</text>
+<path d="M466.2 51.5 l5 5 l5 -5" fill="none" stroke="#f2f2f2" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

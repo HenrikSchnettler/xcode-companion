@@ -9,6 +9,34 @@ It drives Xcode through **Xcode's own MCP server** (`xcrun mcpbridge`, Xcode
 26.3 and newer), the same one Claude uses, so the band and Claude never fight
 over the project.
 
+![The band, ready: device picker, Run, Build, Test, Open in Xcode](docs/images/ready.svg)
+
+## What it looks like
+
+A run waits for a locked iPhone and says what to do:
+
+![Waiting for iPhone 17 Pro to be unlocked](docs/images/locked.svg)
+
+While the app runs, Stop is the only button:
+
+![Running on iPhone 17 Pro](docs/images/running.svg)
+
+After a failed build, the errors go to Claude with one press:
+
+![Build failed · 2 errors, with Ask Claude to fix](docs/images/failed.svg)
+
+While Claude builds, the band waits instead of starting a second build:
+
+![Claude is building, available when Claude is done](docs/images/claude.svg)
+
+Another session on the same checkout is testing, so this one does not build:
+
+![Claude in another session is testing](docs/images/other-session.svg)
+
+Setup goes one step at a time, with the button for that step:
+
+![Xcode has to approve the band](docs/images/setup-approve.svg)
+
 ## What you get
 
 - **Run · Build · Test · Open in Xcode** — on the device or simulator picked in

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="87" viewBox="0 0 1040 87" font-family="-apple-system, BlinkMacSystemFont, &#x27;SF Pro Text&#x27;, &#x27;Helvetica Neue&#x27;, Arial, sans-serif">
+<rect x="0.5" y="0.5" width="1039" height="86" rx="14" fill="#1e1e1e" stroke="#2e2e2e"/>
+<text x="22" y="38.0" font-size="13" fill="#e2b45c">⚒</text>
+<text x="48" y="38.0" font-size="17" fill="#e2b45c">Xcode has to approve the band</text>
+<text x="48" y="60.8" font-size="15" fill="#8f8f8f">Opening MyApp asks Xcode to let the band use this folder</text>
+<rect x="913.8" y="26.5" width="104.2" height="34" rx="9" fill="#3a3a3a"/>
+<text x="965.9" y="48.5" font-size="15" fill="#f2f2f2" text-anchor="middle">Ask Xcode</text>
+</svg>
