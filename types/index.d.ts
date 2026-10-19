@@ -17,6 +17,7 @@ export type SetupStep =
   | 'permission-off'
   | 'mcp-failed'
   | 'auto-mode'
+  | 'held'
   | 'approve'
   | 'open-project'
   | 'ready'
@@ -34,8 +35,6 @@ export type Setup = {
   projects: readonly string[]
   /** The approval dialog was asked for and not yet answered. */
   isApprovalAsked: boolean
-  /** The backend picked before, shown when picking again (`/xcode-backend`). */
-  backend?: Backend | null
 }
 
 /** The project the band works on, as Xcode's MCP server opened it. */
@@ -126,6 +125,26 @@ export type Launched = {
   pid?: number | null
 }
 
+/**
+ * A run started in the Xcode window, past its build, that has not launched
+ * the app yet, as Xcode's launch report tells it: preparing or installing on
+ * the device, launching, or waiting for it to be unlocked.
+ */
+export type XcodeRun = {
+  startedAtMs: number
+  destination: string | null
+  step: 'preparing' | 'installing' | 'launching' | 'locked'
+  /** Xcode waits for the device to be unlocked. */
+  isLocked: boolean
+  /** The workspace whose Stop ends it. */
+  workspaceId?: string
+  /**
+   * Another Xcode window may own it: the launch report names only the scheme,
+   * and another open project could have the same one (a worktree, say).
+   */
+  isUncertain?: boolean
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'xcode-companion': {
@@ -142,7 +161,15 @@ declare module 'claude-code' {
       elsewhere: readonly Elsewhere[]
       /** Polling stopped after a while without anyone using the session. */
       isPaused: boolean
+      /** Checks on Xcode would ask for permission in this mode: the band holds them. */
+      isHeld: boolean
+      /**
+       * The session's permission mode as last reported (classic hook events, the
+       * terminal's hint line); kept here so a reload of the mod does not forget it.
+       */
+      permissionMode: string | null
       phase: RunPhase | null
+      xcodeRun: XcodeRun | null
     }
   }
 }

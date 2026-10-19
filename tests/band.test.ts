@@ -5,7 +5,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
-import { bandView, outcomeOf, readAnswer } from '../hooks/model'
+import { outcomeOf, readAnswer, readLaunchReport, xcodeRunOf } from '../hooks/model'
 
 const T0 = 1_800_000_000_000
 const SURFACES = ['terminal', 'desktop'] as const
@@ -64,8 +64,14 @@ type Host = {
   removed: string[]
   /** `devicectl … lockState`: the device asks for its passcode. */
   isDeviceLocked: boolean
+  /** What Claude Code would decide for the band's own MCP calls: `ask` means a dialog. */
+  decision: 'allow' | 'ask' | 'deny'
+  /** Per tool, over `decision` (allow rules for some tools only). */
+  decisions: Record<string, 'allow' | 'ask' | 'deny'>
   /** The shared registry of builds across sessions: file name to JSON text. */
   registry: Map<string, string>
+  /** Xcode's launch report as `log show` answers it: ndjson lines. */
+  launchLog: string[]
 }
 
 const REGISTRY = '/home/.claude/xcode-companion/busy'
@@ -100,7 +106,10 @@ const host = (on: On, over: Partial<Host> = {}, store: Record<string, unknown> =
     isBuildServiceBusy: true,
     removed: [],
     isDeviceLocked: false,
+    decision: 'allow',
+    decisions: {},
     registry: new Map(),
+    launchLog: [],
     ...over,
   }
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -158,11 +167,13 @@ const host = (on: On, over: Partial<Host> = {}, store: Record<string, unknown> =
     if (argv === 'xcrun --find mcp-server') return seen.hasBridge && seen.isHeadlessCapable ? ok('/x/mcp-server') : fail()
     if (argv.startsWith('xcrun mcp-server status')) return ok(JSON.stringify({ running: true, permission: { enabled: seen.isPermissionOn } }))
     if (argv === 'xcode-select -p') return ok(seen.selected)
+    if (argv.startsWith('/usr/bin/log show')) return ok(seen.launchLog.join('\n'))
     if (argv.startsWith('mdfind')) return ok(seen.isXcodeInstalled ? '/Applications/Xcode.app\n' : '')
     return ok()
   })
 
   on('mcp.connect', () => ({ value: seen.connect }) as never)
+  on('tool.check', (_$, e) => ({ decision: seen.decisions[String(e.tool).replace(/^mcp__\w+?__/, '')] ?? seen.decision }))
   on('mcp.call', async (_$, e) => {
     seen.calls.push({ tool: e.tool, args: e.args, server: e.server })
     const refused = seen.refusals[e.tool]
@@ -595,7 +606,7 @@ const entry = (over: Record<string, unknown> = {}) =>
     ...over,
   })
 
-test('polling pauses after ten idle minutes and starts again on Refresh', async ($, on) => {
+test('polling pauses after ten idle minutes and starts again on Resume', async ($, on) => {
   const { clock, seen } = host(on)
   await start($, clock)
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
@@ -608,9 +619,11 @@ test('polling pauses after ten idle minutes and starts again on Refresh', async 
   await clock.advance(60_000)
   expect(polls()).toBe(atPause)
   expect(await ui.find({ type: 'Text', text: /Paused while idle/ })).toBeDefined()
-  expect(await ui.find({ key: 'xcode-refresh' })).toBeDefined()
+  // Resume sits inline in that sentence, not among the buttons.
+  expect(await ui.find({ key: 'xcode-resume' })).toMatchObject({ props: { label: 'Resume', plain: true } })
+  expect(await ui.find({ key: 'xcode-refresh' })).toBeUndefined()
 
-  await ui.press({ key: 'xcode-refresh' })
+  await ui.press({ key: 'xcode-resume' })
   await clock.advance(8_000)
   expect(polls()).toBeGreaterThan(atPause)
   expect(await ui.find({ type: 'Text', text: /Paused while idle/ })).toBeUndefined()
@@ -905,29 +918,6 @@ test("the project's window in the Xcode app reads as such", async ($, on) => {
   await ui.unmount()
 })
 
-test('picking the backend again names the current one', () => {
-  const view = bandView({
-    setup: { step: 'choose-backend', message: null, xcodeVersion: '27.0', isHeadlessCapable: true, isXcodeOpen: false, projects: [PROJECT], isApprovalAsked: false, backend: 'xcode-mcp' },
-    project: 'App',
-    scheme: null,
-    active: null,
-    activities: [],
-    isExternalBuild: false,
-    launched: null,
-    last: null,
-    isTurn: false,
-    elsewhere: [],
-    projectPath: PROJECT,
-    isPaused: false,
-    via: null,
-    now: 0,
-    spinner: '',
-  })
-  expect(view.headline).toBe('Pick what builds App')
-  expect(view.detail).toMatch(/^Now: Xcode MCP/)
-  expect(view.actions).toEqual(['use-xcode-mcp'])
-})
-
 test('Open in Xcode opens the project in the Xcode app', async ($, on) => {
   const { clock, seen } = host(on)
   await start($, clock)
@@ -1163,5 +1153,261 @@ test("a simulator run is never 'locked'", async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /unlocked/ })).toBeUndefined()
   release()
   await pressed
+  await ui.unmount()
+})
+
+// ── Permission modes that ask for every MCP call ─────────────────────────────
+
+const CHECK_TOOLS = ['GetBuildLog', 'GetConsoleOutput', 'XcodeListRunDestinations', 'XcodeListWorkspaces', 'XcodeCloseWorkspace', 'XcodeOpenWorkspace']
+
+test('a mode that asks for each call: the band asks nothing on its own, and offers Connect', async ($, on) => {
+  const { clock, seen } = host(on, { decision: 'ask' })
+  await start($, clock)
+  await clock.advance(20_000)
+  expect(seen.calls.filter(c => CHECK_TOOLS.includes(c.tool))).toHaveLength(0)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'Connect to Xcode' })).toBeDefined()
+  // The press is the person's: now the band checks, and the dialogs it raises are asked for.
+  await ui.press({ key: 'xcode-connect' })
+  expect(seen.calls.some(c => c.tool === 'XcodeListWorkspaces')).toBe(true)
+  expect(await ui.find({ type: 'Text', text: 'App is ready to run' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('held while ready: live status says it is off, Refresh checks on request, polls stay quiet', async ($, on) => {
+  const { clock, seen } = host(on)
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  seen.decision = 'ask'
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Live status off/ })).toBeDefined()
+  expect(await ui.find({ key: 'xcode-refresh' })).toMatchObject({ props: { label: 'Refresh', plain: true } })
+  const before = seen.calls.length
+  await clock.advance(20_000)
+  expect(seen.calls.slice(before).filter(c => CHECK_TOOLS.includes(c.tool))).toHaveLength(0)
+  await ui.press({ key: 'xcode-refresh' })
+  expect(seen.calls.slice(before).some(c => c.tool === 'XcodeListRunDestinations')).toBe(true)
+  await ui.unmount()
+})
+
+test('held: Run raises the device check and the run itself, nothing more', async ($, on) => {
+  const { clock, seen } = host(on, {
+    answers: { ...hostAnswers(), RunProject: { buildErrors: [], processIdentifier: 7, runResult: 'The app was launched successfully.' } },
+  })
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  seen.decision = 'ask'
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const before = seen.calls.length
+  await ui.press({ key: 'xcode-run' })
+  expect(seen.calls.slice(before).map(c => c.tool)).toEqual(['XcodeListRunDestinations', 'RunProject'])
+  await ui.unmount()
+})
+
+test('held: Run does not go where Xcode moved by itself since the picker last looked', async ($, on) => {
+  const { clock, seen } = host(on, { answers: { ...hostAnswers(), RunProject: { processIdentifier: 7 } } })
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  seen.decision = 'ask'
+  // The picked simulator stays listed, but Xcode now runs on the iPhone.
+  seen.answers.XcodeListRunDestinations = { ...DESTINATIONS, activeDestinationDisplayTitle: 'My iPhone' }
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'xcode-run' })
+  expect(seen.calls.some(c => c.tool === 'RunProject')).toBe(false)
+  await ui.unmount()
+})
+
+test('auto mode lets the band poll though each call would otherwise ask', async ($, on) => {
+  const { clock, seen } = host(on, { decision: 'ask' })
+  on('classic.SessionStart', () => ({}))
+  await $.session.start({ cwd: '/p', surface: 'terminal', isInteractive: true })
+  await $.classic.SessionStart({ source: 'startup', permission_mode: 'auto' } as never)
+  await clock.advance(5_000)
+  expect(seen.calls.some(c => c.tool === 'XcodeListWorkspaces')).toBe(true)
+  expect(seen.calls.some(c => c.tool === 'GetConsoleOutput')).toBe(true)
+})
+
+test('held at Connect: switching to a mode that does not ask sets up by itself, no press', async ($, on) => {
+  const { clock, seen } = host(on, { decision: 'ask' })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'Connect to Xcode' })).toBeDefined()
+  // Bypass: the same question now answers allow.
+  seen.decision = 'allow'
+  await clock.advance(3_000)
+  expect(await ui.find({ type: 'Text', text: 'App is ready to run' })).toBeDefined()
+  await ui.unmount()
+})
+
+test("shift+tab from plan to auto turns live status back on at once", async ($, on) => {
+  const { clock, seen } = host(on)
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  seen.decision = 'ask'
+  await clock.advance(8_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await band.find({ type: 'Text', text: /Live status off/ })).toBeDefined()
+  // The line drawn as it switches names plan, the mode left; then the line at rest.
+  for (const text of ['⏵⏵ plan mode on (shift+tab to cycle)', '(shift+tab to cycle)']) {
+    const hint = await $.ui.mount({ plugin: 'xcode-companion', component: 'PromptHint', surface: 'terminal', props: { isDraft: false, isWorking: false, hint: text } } as never)
+    await clock.advance(10)
+    await hint.unmount()
+  }
+  await clock.advance(4_000)
+  expect(await band.find({ type: 'Text', text: /Live status off/ })).toBeUndefined()
+  expect(seen.calls.slice(-6).some(c => c.tool === 'GetConsoleOutput')).toBe(true)
+  await band.unmount()
+})
+
+test('a reload of the mod remembers the permission mode it was told', async ($, on) => {
+  const { clock, seen } = host(on, { decision: 'ask' })
+  on('classic.SessionStart', () => ({}))
+  await $.session.start({ cwd: '/p', surface: 'terminal', isInteractive: true })
+  await $.classic.SessionStart({ source: 'startup', permission_mode: 'auto' } as never)
+  // The mod reloads: session.start runs again, no classic SessionStart follows.
+  await $.session.start({ cwd: '/p', surface: 'terminal', isInteractive: true })
+  const before = seen.calls.length
+  await clock.advance(5_000)
+  expect(seen.calls.slice(before).some(c => c.tool === 'GetConsoleOutput' || c.tool === 'XcodeListWorkspaces')).toBe(true)
+})
+
+test('shift+tab: the line drawn as it switches names the mode left; the line at rest says the rest', async ($, on) => {
+  const { clock, seen } = host(on)
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  seen.decision = 'ask'
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const isHeldNow = async () => (await band.find({ type: 'Text', text: /Live status off/ })) !== undefined
+  // The terminal hands each line as the engine draws it, one after another.
+  const draw = async (...lines: string[]) => {
+    for (const text of lines) {
+      const ui = await $.ui.mount({ plugin: 'xcode-companion', component: 'PromptHint', surface: 'terminal', props: { isDraft: false, isWorking: false, hint: text } } as never)
+      await clock.advance(10)
+      await ui.unmount()
+    }
+    await clock.advance(4_000)
+  }
+  await draw('? for shortcuts')
+  expect(await isHeldNow()).toBe(true)
+  // manual -> accept edits -> plan: still asking.
+  await draw('manual mode on · ? for shortcuts', '(shift+tab to cycle)')
+  expect(await isHeldNow()).toBe(true)
+  await draw('accept edits on (shift+tab to cycle)', '(shift+tab to cycle)')
+  expect(await isHeldNow()).toBe(true)
+  // plan -> auto: live, and the line at rest keeps it so.
+  await draw('plan mode on (shift+tab to cycle)', '(shift+tab to cycle)')
+  expect(await isHeldNow()).toBe(false)
+  await draw('(shift+tab to cycle)')
+  expect(await isHeldNow()).toBe(false)
+  // auto -> manual: held again at once.
+  await draw('auto mode on (shift+tab to cycle)', '? for shortcuts')
+  expect(await isHeldNow()).toBe(true)
+  await band.unmount()
+})
+
+test('a hint line on the desktop, or one while typing, says nothing about the mode', async ($, on) => {
+  const { clock, seen } = host(on)
+  on('classic.SessionStart', () => ({}))
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  seen.decision = 'ask'
+  await $.classic.SessionStart({ source: 'startup', permission_mode: 'auto' } as never)
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  for (const props of [
+    { surface: 'desktop', isDraft: false, hint: '? for shortcuts' },
+    { surface: 'terminal', isDraft: true, hint: '? for shortcuts' },
+  ]) {
+    const ui = await $.ui.mount({ plugin: 'xcode-companion', component: 'PromptHint', surface: props.surface, props: { isDraft: props.isDraft, isWorking: false, hint: props.hint } } as never)
+    await clock.advance(4_000)
+    await ui.unmount()
+  }
+  expect(await band.find({ type: 'Text', text: /Live status off/ })).toBeUndefined()
+  await band.unmount()
+})
+
+// Xcode's launch report for a run from its window that waits on a locked
+// iPhone, as the unified log has it (ids shortened).
+const LOCKED_RUN = [
+  'a1:a1: Start',
+  'a1:b1:Installing built products Start',
+  'App:Run:a1: Launch App',
+  'a1: My iPhone is connected via network',
+  'a1:b1:Installing built products: Waiting for device unavailability condition to be resolved: My iPhone: Preparing My iPhone',
+  'a1:b1:Installing built products: Installing on My iPhone:',
+  'a1:b1:Installing built products Finished',
+  'a1:c1:Launching App Start',
+  'a1:c1:Launching App: My iPhone is locked, waiting for unlock: Unlock My iPhone to Continue',
+]
+
+test('the launch report walks a run from preparing to waiting for the unlock, and lets go once launched', () => {
+  let runs = {}
+  const steps: (string | null)[] = []
+  for (const line of [...LOCKED_RUN, 'a1:c1:Launching App: Successfully launched App:', 'a1:c1:Launching App Finished']) {
+    runs = readLaunchReport(runs, line, T0)
+    steps.push(xcodeRunOf(runs, 'App', T0)?.step ?? null)
+  }
+  // No scheme until the Launch line names it; then each step as it comes.
+  expect(steps).toEqual([null, null, 'preparing', 'preparing', 'preparing', 'installing', 'installing', 'launching', 'locked', 'locked', null])
+  // Another project's run, a run that ended and one too old are not this band's.
+  const locked = LOCKED_RUN.reduce((r, line) => readLaunchReport(r, line, T0), {})
+  expect(xcodeRunOf(locked, 'Other', T0)).toBeNull()
+  expect(xcodeRunOf(readLaunchReport(locked, 'a1:a1: Finished', T0), 'App', T0)).toBeNull()
+  expect(xcodeRunOf(locked, 'App', T0 + 4 * 3_600_000)).toBeNull()
+  expect(xcodeRunOf(locked, 'App', T0)).toMatchObject({ destination: 'My iPhone', isLocked: true, startedAtMs: T0 })
+})
+
+test('a run from the Xcode window waiting on a locked iPhone shows, with Stop alone, which ends it there', async ($, on) => {
+  const stamp = new Date(T0 - 30_000).toISOString().replace('T', ' ').replace('Z', '+0000')
+  const { clock, seen } = host(on, {
+    answers: { ...hostAnswers(), XcodeListWorkspaces: TWO_OPEN, GetConsoleOutput: launchOf('expired'), StopProject: { stopResult: 'Stopped.' } },
+    isBuildServiceBusy: false,
+    launchLog: LOCKED_RUN.map(eventMessage => JSON.stringify({ eventMessage, timestamp: stamp })),
+  })
+  await start($, clock)
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'Xcode: Waiting for My iPhone to be unlocked' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Unlock My iPhone to launch/ })).toBeDefined()
+  expect(await ui.find({ key: 'xcode-run' })).toBeUndefined()
+  await ui.press({ key: 'xcode-stop' })
+  expect(seen.calls.find(c => c.tool === 'StopProject')?.args.workspaceIdentifier).toBe('windowtab-9')
+  await ui.unmount()
+})
+
+test('a run from the Xcode window that another window may own shows without Stop', async ($, on) => {
+  const stamp = new Date(T0 - 30_000).toISOString().replace('T', ' ').replace('Z', '+0000')
+  // A worktree of the same project is open in a second window: same name, same scheme.
+  const withWorktree = { message: `${TWO_OPEN.message}\n* workspaceIdentifier: windowtab-7, workspacePath: /w/App.xcodeproj` }
+  const { clock, seen } = host(on, {
+    answers: { ...hostAnswers(), XcodeListWorkspaces: withWorktree, GetConsoleOutput: launchOf('expired') },
+    isBuildServiceBusy: false,
+    launchLog: LOCKED_RUN.map(eventMessage => JSON.stringify({ eventMessage, timestamp: stamp })),
+  })
+  await start($, clock)
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'Xcode: Waiting for My iPhone to be unlocked' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /maybe in another window/ })).toBeDefined()
+  expect(await ui.find({ key: 'xcode-stop' })).toBeUndefined()
+  expect(seen.calls.some(c => c.tool === 'StopProject')).toBe(false)
+  await ui.unmount()
+})
+
+test('live status stays off while any polled check would still ask, though others may run', async ($, on) => {
+  const { clock, seen } = host(on)
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  // An allow rule for the console alone: the workspace and device checks still ask.
+  seen.decision = 'ask'
+  seen.decisions = { GetConsoleOutput: 'allow' }
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await clock.advance(16_000)
+  expect(seen.calls.slice(-8).some(c => c.tool === 'GetConsoleOutput')).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /Live status off/ })).toBeDefined()
+  // Rules for all of them: live again, with no press.
+  seen.decisions = { GetConsoleOutput: 'allow', XcodeListWorkspaces: 'allow', XcodeListRunDestinations: 'allow', GetBuildLog: 'allow' }
+  await clock.advance(8_000)
+  expect(await ui.find({ type: 'Text', text: /Live status off/ })).toBeUndefined()
   await ui.unmount()
 })

@@ -4,11 +4,11 @@
 // controls exist in which situation lives here, so the rules are in one place
 // and testable without an engine.
 
-import type { Activity, ActivityKind, Actor, Backend, Destination, Elsewhere, Launched, Outcome, RunPhase, Setup } from '../types'
+import type { Activity, ActivityKind, Actor, Destination, Elsewhere, Launched, Outcome, RunPhase, Setup, XcodeRun } from '../types'
 
 // ── Reading Xcode's MCP answers ─────────────────────────────────────────────
 
-export type Answer = { json: Record<string, unknown> | null; text: string; isError: boolean }
+export type Answer = { json: Record<string, unknown> | null; text: string; isError: boolean; isHeld?: true }
 
 // An MCP result (or a tool.call result carrying one) as text plus its JSON.
 export const readAnswer = (result: unknown, isError = false): Answer => {
@@ -333,6 +333,8 @@ export type Action =
   | 'cancel'
   | 'refresh'
   | 'open-in-xcode'
+  | 'connect'
+  | 'resume'
 
 export const ACTION_LABEL: Record<Action, string> = {
   'use-xcode-mcp': 'Use Xcode MCP',
@@ -353,9 +355,9 @@ export const ACTION_LABEL: Record<Action, string> = {
   cancel: 'Stop',
   refresh: 'Refresh',
   'open-in-xcode': 'Open in Xcode',
+  connect: 'Connect to Xcode',
+  resume: 'Resume',
 }
-
-export const BACKEND_LABEL: Record<Backend, string> = { 'xcode-mcp': 'Xcode MCP' }
 
 export const SELECT_COMMAND = 'sudo xcode-select -s /Applications/Xcode.app'
 export const ENABLE_COMMAND = 'sudo xcrun mcp-server enable'
@@ -368,6 +370,8 @@ export type BandView = {
   note: string | null
   /** The note asks the person to act (unlock the device): drawn in the warning color. */
   isNoteUrgent?: boolean
+  /** A small action drawn inline after the note, as part of its sentence. */
+  noteAction?: Action
   tone: Tone
   /** Drawn right, before the actions: the spinner and elapsed time. */
   busy: string | null
@@ -382,6 +386,76 @@ export type BandView = {
   /** In order; the first is the main one. */
   actions: Action[]
 }
+
+// ── Runs started in the Xcode window ─────────────────────────────────────────
+// Xcode's MCP server says nothing of a run started in its window until the app
+// launches. The Xcode app logs each run to the unified log (subsystem
+// `IDELaunchReport`), every line led by the run's id and the step's:
+//   <run>:<run>: Start                          the run begins (after its build)
+//   <scheme>:Run:<run>: Launch <app>            what it runs
+//   <run>:<step>:Installing built products: Waiting for device unavailability
+//     condition to be resolved: <device>: …     the device is being prepared
+//   <run>:<step>:Installing built products: Installing on <device>:
+//   <run>:<step>:Launching <app> Start
+//   <run>:<step>:Launching <app>: <device> is locked, waiting for unlock: …
+//   <run>:<step>:Launching <app> Finished       launched (or given up)
+//   <run>:<run>: Finished                       the run is over
+
+export type ReportStep = XcodeRun['step']
+export type ReportRun = { startedAtMs: number; scheme: string | null; device: string | null; step: ReportStep }
+export type LaunchReport = Readonly<Record<string, ReportRun>>
+
+// One line of the launch report applied to the runs it tells of.
+export const readLaunchReport = (runs: LaunchReport, message: string, atMs: number): LaunchReport => {
+  const set = (id: string, change: Partial<ReportRun>): LaunchReport =>
+    runs[id] === undefined ? runs : { ...runs, [id]: { ...runs[id], ...change } }
+  const drop = (id: string): LaunchReport => {
+    if (runs[id] === undefined) return runs
+    const { [id]: _, ...rest } = runs
+    return rest
+  }
+  let m: RegExpExecArray | null
+  if ((m = /^([0-9a-f]+):\1: Start$/.exec(message))) return { ...runs, [m[1]]: { startedAtMs: atMs, scheme: null, device: null, step: 'preparing' } }
+  if ((m = /^([0-9a-f]+):\1: Finished$/.exec(message))) return drop(m[1])
+  if ((m = /^(.+):Run:([0-9a-f]+): Launch /.exec(message))) return set(m[2], { scheme: m[1] })
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Installing built products: Waiting for device unavailability condition to be resolved: (.+?): /.exec(message)))
+    return set(m[1], { step: 'preparing', device: m[2] })
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Installing built products: Installing on (.+?):?$/.exec(message))) return set(m[1], { step: 'installing', device: m[2] })
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Launching .+?: (.+) is locked, waiting for unlock/.exec(message))) return set(m[1], { step: 'locked', device: m[2] })
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Launching .+ Start$/.exec(message))) return set(m[1], { step: 'launching' })
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Launching .+ Finished$/.exec(message))) return drop(m[1])
+
+  return runs
+}
+
+// The unified log's time: `2026-10-18 19:50:38.530690+0200`.
+export const logTimeOf = (stamp: string): number | null => {
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?([+-])(\d{2})(\d{2})$/.exec(stamp)
+  if (!m) return null
+  const [y, mo, d, h, mi, sec] = m.slice(1, 7).map(Number)
+  const ms = Math.round(Number(`0.${m[7] ?? '0'}`) * 1000)
+  const offset = (Number(m[9]) * 60 + Number(m[10])) * 60_000 * (m[8] === '-' ? -1 : 1)
+  return Date.UTC(y, mo - 1, d, h, mi, sec, ms) - offset
+}
+
+// A run Xcode has under way for this scheme, past its build and before the
+// app launched; the newest when there are more. One older than `staleMs` is
+// one whose end the band missed.
+export const xcodeRunOf = (runs: LaunchReport, scheme: string | null, now: number, staleMs = 3 * 3_600_000): Omit<XcodeRun, 'workspaceId'> | null => {
+  let found: ReportRun | null = null
+  for (const run of Object.values(runs)) {
+    if (run.scheme === null || (scheme !== null && run.scheme !== scheme) || now - run.startedAtMs > staleMs) continue
+    if (found === null || run.startedAtMs > found.startedAtMs) found = run
+  }
+
+  return found === null ? null : { startedAtMs: found.startedAtMs, destination: found.device, step: found.step, isLocked: found.step === 'locked' }
+}
+
+// Whether a run of `scheme` may be another window's: another open project of
+// the same name (a worktree), or one named like the scheme. Unknown windows
+// (not listed yet) leave it uncertain too.
+export const isRunUncertain = (otherWindows: readonly string[] | null, projectPath: string, scheme: string | null): boolean =>
+  otherWindows === null || otherWindows.some(p => baseName(p) === baseName(projectPath) || (scheme !== null && baseName(p) === scheme))
 
 export type BandInput = {
   setup: Setup
@@ -400,6 +474,8 @@ export type BandInput = {
   projectPath: string | null
   /** Polling stopped while nobody used the session: what it shows may be old. */
   isPaused: boolean
+  /** The band's own checks on Xcode would ask for permission: it holds them. */
+  isHeld?: boolean
   /**
    * Where Xcode does the band's work: the Xcode app's window for the project,
    * or the headless server, which builds with no window open.
@@ -407,6 +483,8 @@ export type BandInput = {
   via: 'window' | 'headless' | null
   /** Where the current run stands, when one runs. */
   phase?: RunPhase | null
+  /** A run started in the Xcode window, waiting on the device. */
+  xcodeRun?: XcodeRun | null
   now: number
   spinner: string
 }
@@ -471,19 +549,12 @@ const setupView = (s: Setup, project: string | null): BandView => {
     case 'no-project':
       return view('No Xcode project here', null, [], 'calm')
     case 'choose-backend':
-      return s.backend
-        ? view(
-            `Pick what builds ${project ?? 'the project'}`,
-            `Now: ${BACKEND_LABEL[s.backend]} · the band builds, runs and tests through it · more backends to come`,
-            ['use-xcode-mcp'],
-            'calm',
-          )
-        : view(
-            `${project ?? 'Xcode project'} found · pick what builds it`,
-            'The band builds, runs and tests through it · more backends later',
-            ['use-xcode-mcp'],
-            'calm',
-          )
+      return view(
+        `${project ?? 'Xcode project'} found · pick what builds it`,
+        'The band builds, runs and tests through it · more backends later',
+        ['use-xcode-mcp'],
+        'calm',
+      )
     case 'pick-project':
       return { ...view('Several Xcode projects here · pick one', null, [], 'calm'), hasProjectPicker: true }
     case 'no-xcode':
@@ -503,6 +574,13 @@ const setupView = (s: Setup, project: string | null): BandView => {
         "Xcode doesn't let agents use its tools yet",
         `Turn it on in Xcode › Settings › Intelligence, or headless in a terminal: ${ENABLE_COMMAND}`,
         s.isXcodeOpen ? ['copy-enable', 'recheck'] : ['open-xcode', 'copy-enable', 'recheck'],
+      )
+    case 'held':
+      return view(
+        'Connect to Xcode',
+        'In this permission mode every check on Xcode asks first, so the band waits for you',
+        ['connect'],
+        'calm',
       )
     case 'mcp-failed':
       return view("Can't reach Xcode's MCP server", s.message, ['reconnect'], 'error')
@@ -600,6 +678,35 @@ export const bandView = (i: BandInput): BandView => {
     }
   }
 
+  // A run started in the Xcode window, built, that has not launched the app:
+  // Xcode waits on the device, a locked one until it is unlocked. Stop ends
+  // it as Xcode's own Stop would.
+  if (i.xcodeRun) {
+    const device = i.xcodeRun.destination ?? 'the device'
+    const doing =
+      i.xcodeRun.step === 'locked'
+        ? `Waiting for ${device} to be unlocked`
+        : i.xcodeRun.step === 'preparing'
+          ? `Preparing ${device}`
+          : i.xcodeRun.step === 'installing'
+            ? `Installing ${project} on ${device}`
+            : `Launching ${project} on ${device}`
+    return {
+      headline: `Xcode: ${doing}`,
+      // Another window may own it: shown, but not the band's to stop.
+      detail: facts(i.scheme, i.xcodeRun.isUncertain ? 'started in Xcode, maybe in another window' : 'started in Xcode'),
+      note: i.xcodeRun.isLocked ? `Unlock ${device} to launch ${project}` : null,
+      isNoteUrgent: i.xcodeRun.isLocked,
+      tone: 'busy',
+      busy: `${i.spinner} ${fmtElapsed(i.now - i.xcodeRun.startedAtMs)}`,
+      waiting: i.xcodeRun.isUncertain ? 'Available when Xcode is done' : null,
+      where,
+      hasPicker: false,
+      hasProjectPicker: false,
+      actions: i.xcodeRun.isUncertain ? [] : ['stop'],
+    }
+  }
+
   // A launch newer than the last result leads: it is what runs now.
   const isRunningNow = i.launched !== null && (i.last === null || i.launched.atMs >= i.last.atMs)
   const headline = isRunningNow
@@ -670,14 +777,15 @@ export const bandView = (i: BandInput): BandView => {
   return {
     headline,
     detail,
-    note: i.isPaused ? 'Paused while idle · devices and builds elsewhere may have changed' : null,
+    note: i.isHeld ? 'Live status off in this mode ·' : i.isPaused ? 'Paused while idle ·' : null,
+    noteAction: i.isHeld ? 'refresh' : i.isPaused ? 'resume' : undefined,
     tone,
     busy: null,
     waiting: null,
     where,
     hasPicker: true,
     hasProjectPicker: false,
-    actions: [...(canHandOver ? (['hand-over'] as Action[]) : []), 'run', 'build', 'test', ...stop, 'open-in-xcode', ...(i.isPaused ? (['refresh'] as Action[]) : [])],
+    actions: [...(canHandOver ? (['hand-over'] as Action[]) : []), 'run', 'build', 'test', ...stop, 'open-in-xcode'],
   }
 }
 
@@ -685,6 +793,7 @@ export const bandView = (i: BandInput): BandView => {
 export const refusal = (
   i: Pick<BandInput, 'setup' | 'activities' | 'isExternalBuild' | 'isTurn' | 'elsewhere' | 'projectPath' | 'active'> & {
     launched?: Launched | null
+    xcodeRun?: XcodeRun | null
   },
   kind: ActivityKind,
 ): string | null => {
@@ -695,6 +804,7 @@ export const refusal = (
   if (current) return current.by === 'claude' ? 'Claude is building right now.' : 'The band is already building.'
   if (i.isExternalBuild) return 'Xcode is already building.'
   if (i.launched) return `The app is running${i.launched.destination ? ` on ${i.launched.destination}` : ''}: stop it first.`
+  if (i.xcodeRun) return `Xcode is launching the app${i.xcodeRun.destination ? ` on ${i.xcodeRun.destination}` : ''}: stop it first.`
   const held = conflictsOf(i)
   if (held.project) return `${sessionLabel(held.project).replace(/^a/, 'A')} is ${VERB[held.project.kind]} this project.`
   if (held.device) return `${i.active} is in use by ${sessionLabel(held.device)}.`

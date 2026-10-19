@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="109" viewBox="0 0 1040 109" font-family="-apple-system, BlinkMacSystemFont, &#x27;SF Pro Text&#x27;, &#x27;Helvetica Neue&#x27;, Arial, sans-serif">
+<rect x="0.5" y="0.5" width="1039" height="108" rx="14" fill="#1e1e1e" stroke="#2e2e2e"/>
+<text x="22" y="38.0" font-size="13" fill="#7fa8f0">⚒</text>
+<text x="48" y="38.0" font-size="17" fill="#7fa8f0">Claude is building for iPhone 17 Pro</text>
+<text x="48" y="60.8" font-size="15" fill="#8f8f8f">MyApp</text>
+<text x="48" y="82.8" font-size="15" fill="#8f8f8f">Xcode window</text>
+<text x="1018.0" y="59.5" font-size="15" fill="#8f8f8f" text-anchor="end">Available when Claude is done</text>
+<text x="787.5" y="59.5" font-size="16" font-weight="600" fill="#7fa8f0" text-anchor="end">⠋ 0:18</text>
+</svg>

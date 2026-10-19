@@ -88,16 +88,52 @@ Established against Xcode 27.0 (`xcrun mcpbridge`, server `xcode-tools`):
 - **Device locked**: `xcrun devicectl device info lockState --device <name>
   --json-output /dev/stdout` → `result.passcodeRequired`, under a second.
   Simulators answer an error (no lock state).
+- **A run started in the Xcode window**: Xcode's MCP server says nothing of it
+  until the app has launched (no build running, the last launch session
+  expired). The Xcode app logs each run to the unified log, subsystem
+  `IDELaunchReport`, every line led by `<run id>:<step id>:` — `<run>:<run>:
+  Start`, `<scheme>:Run:<run>: Launch <app>`, `Installing built products:
+  Waiting for device unavailability condition to be resolved: <device>: …`,
+  `Installing on <device>:`, `Launching <app> Start`, `Launching <app>: <device>
+  is locked, waiting for unlock`, `Launching <app> Finished`, `<run>:<run>:
+  Finished`. The band reads the last half hour once (`log show --style
+  ndjson`, about two seconds) and then follows `log stream` with the same
+  predicate, which is idle while Xcode launches nothing. DerivedData's
+  `Logs/Launch` does not help: Xcode records the run as finished before the
+  launch.
 
 ## The plugin API: what the code relies on
 
 - `$.mcp.call` is documented as needing no permission ("the plugin's call … is
-  the grant"). The terminal honours that. The **desktop app** does not: in auto
-  mode it sends the call to the classifier, which refuses it
-  ([anthropics/claude-code#101884](https://github.com/anthropics/claude-code/issues/101884));
-  in manual mode it shows a permission dialog per call. A `tool.check` hook
+  the grant"). In practice that holds only in bypass mode and, in the
+  terminal, in auto mode. The desktop app's auto mode refuses the call
+  ([anthropics/claude-code#101884](https://github.com/anthropics/claude-code/issues/101884)),
+  and in default, accept-edits and plan mode both surfaces show a permission
+  dialog per call (the terminal's has no "always allow"). A `tool.check` hook
   cannot help: the engine skips a mod's own hooks for calls the mod made
   (re-entry), and a hook that loosens permissions is not this plugin's to ship.
+- So the band's **checks** (`CHECKS` in `register.tsx`: the read-only tools,
+  plus opening and closing the headless workspace) run unasked only when
+  `$.tool.check` says `allow` or the mode is auto or bypass. No event announces
+  a mode switch: the mode comes from `permission_mode` on the classic hook
+  events (`UserPromptSubmit`, `Stop`; `SessionStart` carries none) and, in the
+  terminal, from the hint line under the prompt (`PromptHint`). That line never
+  names the mode it is in: as shift+tab switches, the line handed to the hook
+  is the one drawn before, naming the mode **left** (`plan mode on (shift+tab
+  to cycle)`); at rest it reads `? for shortcuts` in manual mode and `(shift+tab
+  to cycle)` in every other. So the mode is the one after the mode left, in
+  shift+tab's order (default, acceptEdits, plan, auto, bypassPermissions), and
+  manual on `? for shortcuts` (`modeAtRest`). A switch into a mode that asks
+  holds at once. Otherwise they are held (`isHeld`, setup step `held`) and run
+  only inside a press that asks for them (Connect, Refresh, setup buttons).
+  Live status needs **all** the polled checks (`POLLED`): one that may run
+  (an allow rule for one tool) clears nothing; every 4th tick `syncHeld` asks
+  `$.tool.check` for each (no dialog; it answers `allow` in bypass mode or
+  under a rule), and the `held` setup step is re-checked every 3 s.
+- Actions always go through: the press is the person's. Run, Build and Test
+  also refresh the device list inside the press, held or not, so a run never
+  lands on a destination Xcode moved to by itself; with no fresh answer they
+  refuse.
 - `$.mcp.connect('xcode')` connects the server the manifest ships and answers
   the name to call it by; when the person registered the same server already,
   it answers that one's name (`xcode`) instead of starting a second.
@@ -137,6 +173,14 @@ Established against Xcode 27.0 (`xcrun mcpbridge`, server `xcode-tools`):
   Claude's turn; workspaces and devices are refreshed when it ends.
 - **Run phases** follow a run every 2 s: building (build service has children),
   launching, locked (`devicectl`), until RunProject returns.
+- **Runs from the Xcode window** (`xcodeRun`, from the launch report): past the
+  build and before the app runs, the band shows preparing, installing,
+  launching or "Waiting for <device> to be unlocked" with Stop alone (in the
+  window's workspace); Run, Build and Test are refused meanwhile. A run of
+  another scheme, or older than three hours, is not the band's. The report
+  names only the scheme: while another window holds a project of the same
+  name or one named like the scheme (a worktree), or before the windows were
+  first listed, the run is `isUncertain` and shown without Stop.
 - **Results** say what happened (`Launched on …`), never what is (`Running on`
   comes only from a live launch session). A launch that ends is marked
   `App ended`, with who launched it and when it ended; who ended it is unknown.
