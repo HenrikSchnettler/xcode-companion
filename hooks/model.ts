@@ -451,6 +451,12 @@ export const xcodeRunOf = (runs: LaunchReport, scheme: string | null, now: numbe
   return found === null ? null : { startedAtMs: found.startedAtMs, destination: found.device, step: found.step, isLocked: found.step === 'locked' }
 }
 
+// Whether a run of `scheme` may be another window's: another open project of
+// the same name (a worktree), or one named like the scheme. Unknown windows
+// (not listed yet) leave it uncertain too.
+export const isRunUncertain = (otherWindows: readonly string[] | null, projectPath: string, scheme: string | null): boolean =>
+  otherWindows === null || otherWindows.some(p => baseName(p) === baseName(projectPath) || (scheme !== null && baseName(p) === scheme))
+
 export type BandInput = {
   setup: Setup
   project: string | null
@@ -687,16 +693,17 @@ export const bandView = (i: BandInput): BandView => {
             : `Launching ${project} on ${device}`
     return {
       headline: `Xcode: ${doing}`,
-      detail: facts(i.scheme, 'started in Xcode'),
+      // Another window may own it: shown, but not the band's to stop.
+      detail: facts(i.scheme, i.xcodeRun.isUncertain ? 'started in Xcode, maybe in another window' : 'started in Xcode'),
       note: i.xcodeRun.isLocked ? `Unlock ${device} to launch ${project}` : null,
       isNoteUrgent: i.xcodeRun.isLocked,
       tone: 'busy',
       busy: `${i.spinner} ${fmtElapsed(i.now - i.xcodeRun.startedAtMs)}`,
-      waiting: null,
+      waiting: i.xcodeRun.isUncertain ? 'Available when Xcode is done' : null,
       where,
       hasPicker: false,
       hasProjectPicker: false,
-      actions: ['stop'],
+      actions: i.xcodeRun.isUncertain ? [] : ['stop'],
     }
   }
 

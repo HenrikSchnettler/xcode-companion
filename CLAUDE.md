@@ -124,11 +124,16 @@ Established against Xcode 27.0 (`xcrun mcpbridge`, server `xcode-tools`):
   to cycle)` in every other. So the mode is the one after the mode left, in
   shift+tab's order (default, acceptEdits, plan, auto, bypassPermissions), and
   manual on `? for shortcuts` (`modeAtRest`). A switch into a mode that asks
-  holds at once. While held, the band also asks `$.tool.check` again on every
-  poll (it answers `allow` in bypass mode) and every 3 s at the `held` setup
-  step. Otherwise they are held (`isHeld`, setup step
-  `held`) and run only inside a press that asks for them (Connect, Refresh,
-  setup buttons). Actions always go through: the press is the person's.
+  holds at once. Otherwise they are held (`isHeld`, setup step `held`) and run
+  only inside a press that asks for them (Connect, Refresh, setup buttons).
+  Live status needs **all** the polled checks (`POLLED`): one that may run
+  (an allow rule for one tool) clears nothing; every 4th tick `syncHeld` asks
+  `$.tool.check` for each (no dialog; it answers `allow` in bypass mode or
+  under a rule), and the `held` setup step is re-checked every 3 s.
+- Actions always go through: the press is the person's. Run, Build and Test
+  also refresh the device list inside the press, held or not, so a run never
+  lands on a destination Xcode moved to by itself; with no fresh answer they
+  refuse.
 - `$.mcp.connect('xcode')` connects the server the manifest ships and answers
   the name to call it by; when the person registered the same server already,
   it answers that one's name (`xcode`) instead of starting a second.
@@ -172,7 +177,10 @@ Established against Xcode 27.0 (`xcrun mcpbridge`, server `xcode-tools`):
   build and before the app runs, the band shows preparing, installing,
   launching or "Waiting for <device> to be unlocked" with Stop alone (in the
   window's workspace); Run, Build and Test are refused meanwhile. A run of
-  another scheme, or older than three hours, is not the band's.
+  another scheme, or older than three hours, is not the band's. The report
+  names only the scheme: while another window holds a project of the same
+  name or one named like the scheme (a worktree), or before the windows were
+  first listed, the run is `isUncertain` and shown without Stop.
 - **Results** say what happened (`Launched on …`), never what is (`Running on`
   comes only from a live launch session). A launch that ends is marked
   `App ended`, with who launched it and when it ended; who ended it is unknown.

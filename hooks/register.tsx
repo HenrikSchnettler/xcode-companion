@@ -28,6 +28,7 @@ import {
   isApprovalRefusal,
   isAutoModeRefusal,
   isPermissionRefusal,
+  isRunUncertain,
   logTimeOf,
   outcomeOf,
   parseDestinations,
@@ -116,6 +117,9 @@ let heartbeat: Timer | null = null
 // The session's permission mode, as the classic hooks report it or the terminal's
 // hint line implies it (modeAtRest); null until either has.
 let permissionMode: string | null = null
+// The projects open in other Xcode windows, as the last workspace listing had
+// them; null until one has.
+let otherWindows: readonly string[] | null = null
 // A press that asks the band to check on Xcode (Connect, Refresh, a setup step):
 // its checks may ask for permission, the person having asked for them.
 let checking = 0
@@ -173,6 +177,23 @@ const mayCheck = async ($: EngineInterface, tool: string): Promise<boolean> => {
   }
 }
 
+// The checks the polling needs for live status.
+const POLLED = ['XcodeListWorkspaces', 'GetConsoleOutput', 'XcodeListRunDestinations', 'GetBuildLog'] as const
+
+// Held while any polled check would ask: asking costs no dialog, so this is
+// how live status comes back after a mode switch or a new allow rule.
+const syncHeld = async ($: EngineInterface) => {
+  if (checking > 0) return
+  let held = false
+  for (const tool of POLLED) {
+    if (!(await mayCheck($, tool))) {
+      held = true
+      break
+    }
+  }
+  if (held !== (await read($, isHeld))) await update($, isHeld, () => held)
+}
+
 // One call on Xcode's MCP server, aimed at the band's workspace unless told otherwise.
 // `target` names another of the project's workspaces (where an app runs).
 const xcode = async (
@@ -186,7 +207,9 @@ const xcode = async (
   if (name === null) return { json: null, text: "Xcode's MCP server is not connected.", isError: true }
   if (CHECKS.has(tool)) {
     const may = await mayCheck($, tool)
-    if (may !== !(await read($, isHeld))) await update($, isHeld, () => !may)
+    // One check that may run says nothing of the others: live status comes
+    // back only once all the polled ones may (syncHeld).
+    if (!may && !(await read($, isHeld))) await update($, isHeld, () => true)
     if (!may) return { json: null, text: 'Held: this check would ask for permission.', isError: true, isHeld: true }
   }
   const id = target ?? (isScoped ? (await read($, workspace))?.id : undefined)
@@ -508,12 +531,14 @@ const findProjects = async ($: EngineInterface, cwd: string): Promise<string[]> 
 // Xcode's run destinations as one answer listed them: the picker's options and
 // the active one. A device unplugged is gone from the next answer, and Xcode
 // moves the active destination off it by itself.
-const applyDestinations = async ($: EngineInterface, a: Answer) => {
-  if (a.isError) return
+// Whether the answer was fresh (a held or failed one leaves the list as it was).
+const applyDestinations = async ($: EngineInterface, a: Answer): Promise<boolean> => {
+  if (a.isError) return false
   const { list, active: now, scheme } = parseDestinations(a)
   await update($, destinations, () => list)
   await update($, active, () => now)
   if (scheme !== null) await update($, workspace, (w: Workspace | null) => (w === null || w.scheme === scheme ? w : { ...w, scheme }))
+  return true
 }
 
 const loadDestinations = async ($: EngineInterface) => applyDestinations($, await xcode($, 'XcodeListRunDestinations'))
@@ -641,7 +666,9 @@ const refreshWorkspaces = async ($: EngineInterface) => {
   try {
     const listed = await xcode($, 'XcodeListWorkspaces', {}, false)
     if (listed.isError) return
-    let opens = parseWorkspaces(listed).filter(w => w.path === ws.path)
+    const all = parseWorkspaces(listed)
+    otherWindows = all.filter(w => w.id.startsWith('windowtab-') && w.path !== ws.path).map(w => w.path)
+    let opens = all.filter(w => w.path === ws.path)
     if (opens.some(w => w.id.startsWith('windowtab-'))) {
       for (const headless of opens.filter(w => !w.id.startsWith('windowtab-'))) {
         if (await isInUse($, headless.id)) continue
@@ -672,6 +699,7 @@ const poll = async ($: EngineInterface, isForced = false) => {
   isPolling = true
   try {
     polls += 1
+    if (polls % APP_EVERY === 0) await syncHeld($)
     // Xcode opened or closed (by the band or not): seen within 8 s.
     if (polls % WORKSPACES_EVERY === 0) await refreshWorkspaces($)
     const ws = await read($, workspace)
@@ -784,7 +812,8 @@ const syncXcodeRun = async ($: EngineInterface) => {
   const ws = await read($, workspace)
   const found = ws === null ? null : xcodeRunOf(report, ws.scheme ?? null, await $.clock.now())
   const window = ws === null ? undefined : watchedOf(ws).find(id => id.startsWith('windowtab-'))
-  const next: XcodeRun | null = found === null ? null : { ...found, workspaceId: window }
+  const isUncertain = ws === null || isRunUncertain(otherWindows, ws.path, ws.scheme ?? null)
+  const next: XcodeRun | null = found === null ? null : { ...found, workspaceId: window, isUncertain }
   const before = await read($, xcodeRun)
   if (JSON.stringify(before) === JSON.stringify(next)) return
   await update($, xcodeRun, () => next)
@@ -839,11 +868,21 @@ const act = async ($: EngineInterface, kind: 'run' | 'build' | 'test' | 'stop') 
     // fresh list, and Xcode has moved to another destination by itself. Never
     // run on a device the person did not pick.
     const picked = await read($, active)
-    await loadDestinations($)
+    // Asked even where checks would ask for permission: the person pressed,
+    // and an old list would let the run land where Xcode moved by itself.
+    checking += 1
+    let isFresh = false
+    try {
+      isFresh = await loadDestinations($)
+    } finally {
+      checking -= 1
+    }
+    const label = kind === 'test' ? 'Test' : kind === 'build' ? 'Build' : 'Run'
+    if (!isFresh) return void $.ui.toast(`Xcode did not say which device is picked: press ${label} again.`)
     const now = await read($, active)
     const isListed = (await read($, destinations)).some(d => d.title === picked)
     if (picked === null || !isListed || now !== picked) {
-      return void $.ui.toast(`${picked ?? 'The device'} is no longer available: pick a device and press ${kind === 'test' ? 'Test' : kind === 'build' ? 'Build' : 'Run'} again.`)
+      return void $.ui.toast(`${picked ?? 'The device'} is no longer available: pick a device and press ${label} again.`)
     }
   }
   const activity = await begin($, kind, 'band')
@@ -862,7 +901,8 @@ const act = async ($: EngineInterface, kind: 'run' | 'build' | 'test' | 'stop') 
     }
   }
   // Stop ends the app where it runs, which may be the Xcode app's window.
-  const target = kind === 'stop' ? ((await read($, launched))?.workspaceId ?? (await read($, xcodeRun))?.workspaceId) : undefined
+  const run = await read($, xcodeRun)
+  const target = kind === 'stop' ? ((await read($, launched))?.workspaceId ?? (run?.isUncertain ? undefined : run?.workspaceId)) : undefined
   const answer = await xcode($, TOOL[kind], {}, true, target)
   // Cancelled meanwhile: the band has moved on, and this answer is stale.
   if (cancelled.delete(activity.id)) return

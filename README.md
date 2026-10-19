@@ -153,11 +153,12 @@ not always agree, so how live the band is depends on the permission mode:
 
 In a mode that would ask, the band **never raises a dialog by itself**. It
 shows **Connect to Xcode** (or "Live status off", with **Refresh** in that line) and checks
-on Xcode only when you press one of them. Run, Build and Test ask once, for the
-action itself, with no checks around it. Allow rules for the read-only tools
+on Xcode only when you press one of them. Run, Build and Test ask twice: once
+to check the picked device is still the one Xcode runs on, once for the action
+itself. Allow rules for all four read-only tools the polling uses
 (`GetConsoleOutput`, `XcodeListWorkspaces`, `XcodeListRunDestinations`,
-`GetBuildLog`, `XcodeCloseWorkspace`, `XcodeOpenWorkspace`) turn live status
-on in those modes too; they also let Claude use those tools without asking.
+`GetBuildLog`) turn live status on in those modes too; they also let Claude use
+those tools without asking.
 
 In the terminal the band follows a **Shift+Tab** switch at once. In the desktop
 app it learns a new mode with your next prompt, or sooner when the mode is bypass.

@@ -66,6 +66,8 @@ type Host = {
   isDeviceLocked: boolean
   /** What Claude Code would decide for the band's own MCP calls: `ask` means a dialog. */
   decision: 'allow' | 'ask' | 'deny'
+  /** Per tool, over `decision` (allow rules for some tools only). */
+  decisions: Record<string, 'allow' | 'ask' | 'deny'>
   /** The shared registry of builds across sessions: file name to JSON text. */
   registry: Map<string, string>
   /** Xcode's launch report as `log show` answers it: ndjson lines. */
@@ -105,6 +107,7 @@ const host = (on: On, over: Partial<Host> = {}, store: Record<string, unknown> =
     removed: [],
     isDeviceLocked: false,
     decision: 'allow',
+    decisions: {},
     registry: new Map(),
     launchLog: [],
     ...over,
@@ -170,7 +173,7 @@ const host = (on: On, over: Partial<Host> = {}, store: Record<string, unknown> =
   })
 
   on('mcp.connect', () => ({ value: seen.connect }) as never)
-  on('tool.check', () => ({ decision: seen.decision }))
+  on('tool.check', (_$, e) => ({ decision: seen.decisions[String(e.tool).replace(/^mcp__\w+?__/, '')] ?? seen.decision }))
   on('mcp.call', async (_$, e) => {
     seen.calls.push({ tool: e.tool, args: e.args, server: e.server })
     const refused = seen.refusals[e.tool]
@@ -1188,7 +1191,7 @@ test('held while ready: live status says it is off, Refresh checks on request, p
   await ui.unmount()
 })
 
-test('held: Run raises one call, the run itself, with no checks around it', async ($, on) => {
+test('held: Run raises the device check and the run itself, nothing more', async ($, on) => {
   const { clock, seen } = host(on, {
     answers: { ...hostAnswers(), RunProject: { buildErrors: [], processIdentifier: 7, runResult: 'The app was launched successfully.' } },
   })
@@ -1198,7 +1201,20 @@ test('held: Run raises one call, the run itself, with no checks around it', asyn
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   const before = seen.calls.length
   await ui.press({ key: 'xcode-run' })
-  expect(seen.calls.slice(before).map(c => c.tool)).toEqual(['RunProject'])
+  expect(seen.calls.slice(before).map(c => c.tool)).toEqual(['XcodeListRunDestinations', 'RunProject'])
+  await ui.unmount()
+})
+
+test('held: Run does not go where Xcode moved by itself since the picker last looked', async ($, on) => {
+  const { clock, seen } = host(on, { answers: { ...hostAnswers(), RunProject: { processIdentifier: 7 } } })
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  seen.decision = 'ask'
+  // The picked simulator stays listed, but Xcode now runs on the iPhone.
+  seen.answers.XcodeListRunDestinations = { ...DESTINATIONS, activeDestinationDisplayTitle: 'My iPhone' }
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'xcode-run' })
+  expect(seen.calls.some(c => c.tool === 'RunProject')).toBe(false)
   await ui.unmount()
 })
 
@@ -1356,5 +1372,42 @@ test('a run from the Xcode window waiting on a locked iPhone shows, with Stop al
   expect(await ui.find({ key: 'xcode-run' })).toBeUndefined()
   await ui.press({ key: 'xcode-stop' })
   expect(seen.calls.find(c => c.tool === 'StopProject')?.args.workspaceIdentifier).toBe('windowtab-9')
+  await ui.unmount()
+})
+
+test('a run from the Xcode window that another window may own shows without Stop', async ($, on) => {
+  const stamp = new Date(T0 - 30_000).toISOString().replace('T', ' ').replace('Z', '+0000')
+  // A worktree of the same project is open in a second window: same name, same scheme.
+  const withWorktree = { message: `${TWO_OPEN.message}\n* workspaceIdentifier: windowtab-7, workspacePath: /w/App.xcodeproj` }
+  const { clock, seen } = host(on, {
+    answers: { ...hostAnswers(), XcodeListWorkspaces: withWorktree, GetConsoleOutput: launchOf('expired') },
+    isBuildServiceBusy: false,
+    launchLog: LOCKED_RUN.map(eventMessage => JSON.stringify({ eventMessage, timestamp: stamp })),
+  })
+  await start($, clock)
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'Xcode: Waiting for My iPhone to be unlocked' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /maybe in another window/ })).toBeDefined()
+  expect(await ui.find({ key: 'xcode-stop' })).toBeUndefined()
+  expect(seen.calls.some(c => c.tool === 'StopProject')).toBe(false)
+  await ui.unmount()
+})
+
+test('live status stays off while any polled check would still ask, though others may run', async ($, on) => {
+  const { clock, seen } = host(on)
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  // An allow rule for the console alone: the workspace and device checks still ask.
+  seen.decision = 'ask'
+  seen.decisions = { GetConsoleOutput: 'allow' }
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await clock.advance(16_000)
+  expect(seen.calls.slice(-8).some(c => c.tool === 'GetConsoleOutput')).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /Live status off/ })).toBeDefined()
+  // Rules for all of them: live again, with no press.
+  seen.decisions = { GetConsoleOutput: 'allow', XcodeListWorkspaces: 'allow', XcodeListRunDestinations: 'allow', GetBuildLog: 'allow' }
+  await clock.advance(8_000)
+  expect(await ui.find({ type: 'Text', text: /Live status off/ })).toBeUndefined()
   await ui.unmount()
 })

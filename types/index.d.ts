@@ -138,6 +138,11 @@ export type XcodeRun = {
   isLocked: boolean
   /** The workspace whose Stop ends it. */
   workspaceId?: string
+  /**
+   * Another Xcode window may own it: the launch report names only the scheme,
+   * and another open project could have the same one (a worktree, say).
+   */
+  isUncertain?: boolean
 }
 
 declare module 'claude-code' {
