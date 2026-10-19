@@ -13,8 +13,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Activity, ActivityKind, Actor, Backend, Destination, Elsewhere, Outcome, RunPhase, Setup, Workspace } from '../types'
-import type { Action, Answer } from './model'
+import type { Activity, ActivityKind, Actor, Backend, Destination, Elsewhere, Outcome, RunPhase, Setup, Workspace, XcodeRun } from '../types'
+import type { Action, Answer, LaunchReport } from './model'
 import {
   ACTION_LABEL,
   DESKTOP_BUG_URL,
@@ -28,6 +28,7 @@ import {
   isApprovalRefusal,
   isAutoModeRefusal,
   isPermissionRefusal,
+  logTimeOf,
   outcomeOf,
   parseDestinations,
   parseLaunch,
@@ -35,8 +36,10 @@ import {
   parseVersion,
   parseWorkspaces,
   readAnswer,
+  readLaunchReport,
   refusal,
   shellBuild,
+  xcodeRunOf,
   xcodeTool,
 } from './model'
 
@@ -63,6 +66,9 @@ const frame = atom({ plugin: 'xcode-companion', key: 'frame' } as const, 0)
 const elsewhere = atom({ plugin: 'xcode-companion', key: 'elsewhere' } as const, [])
 const isPaused = atom({ plugin: 'xcode-companion', key: 'isPaused' } as const, false)
 const phase = atom({ plugin: 'xcode-companion', key: 'phase' } as const, null)
+const isHeld = atom({ plugin: 'xcode-companion', key: 'isHeld' } as const, false)
+const knownMode = atom({ plugin: 'xcode-companion', key: 'permissionMode' } as const, null)
+const xcodeRun = atom({ plugin: 'xcode-companion', key: 'xcodeRun' } as const, null)
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 const APP_STORE = 'macappstore://apps.apple.com/app/id497799835'
@@ -107,6 +113,12 @@ let lastActiveMs = 0
 let pollTimer: Timer | null = null
 let probeTimer: Timer | null = null
 let heartbeat: Timer | null = null
+// The session's permission mode, as the classic hooks report it or the terminal's
+// hint line implies it (modeAtRest); null until either has.
+let permissionMode: string | null = null
+// A press that asks the band to check on Xcode (Connect, Refresh, a setup step):
+// its checks may ask for permission, the person having asked for them.
+let checking = 0
 // Follows a run under way, every PHASE_MS, until it ends.
 let phaseTimer: Timer | null = null
 const PHASE_MS = 2_000
@@ -134,6 +146,33 @@ const connect = async ($: EngineInterface): Promise<string | null> => {
   return server
 }
 
+// The band's own checks on Xcode: they read, and run unasked (polling, setup,
+// the look before an action). Actions (Run, Build, Test, Stop, a device switch)
+// are the person's presses and always go through.
+const CHECKS = new Set([
+  'GetBuildLog',
+  'GetConsoleOutput',
+  'XcodeListRunDestinations',
+  'XcodeListWorkspaces',
+  'XcodeCloseWorkspace',
+  'XcodeOpenWorkspace',
+])
+// Modes where Claude Code lets a mod's own calls through without a dialog.
+const UNASKED_MODES = new Set(['auto', 'bypassPermissions'])
+
+// Whether a check would run without a permission dialog. Claude Code asks for
+// a mod's own MCP calls in most modes, though the plugin API says it should
+// not; the band never raises a dialog the person did not ask for.
+const mayCheck = async ($: EngineInterface, tool: string): Promise<boolean> => {
+  if (checking > 0 || (permissionMode !== null && UNASKED_MODES.has(permissionMode))) return true
+  const name = `mcp__${(server ?? 'xcode').replace(/:/g, '_')}__${tool}`
+  try {
+    return (await $.tool.check({ tool: name, input: {} })).decision === 'allow'
+  } catch {
+    return false
+  }
+}
+
 // One call on Xcode's MCP server, aimed at the band's workspace unless told otherwise.
 // `target` names another of the project's workspaces (where an app runs).
 const xcode = async (
@@ -145,6 +184,11 @@ const xcode = async (
 ): Promise<Answer> => {
   const name = await connect($)
   if (name === null) return { json: null, text: "Xcode's MCP server is not connected.", isError: true }
+  if (CHECKS.has(tool)) {
+    const may = await mayCheck($, tool)
+    if (may !== !(await read($, isHeld))) await update($, isHeld, () => !may)
+    if (!may) return { json: null, text: 'Held: this check would ask for permission.', isError: true, isHeld: true }
+  }
   const id = target ?? (isScoped ? (await read($, workspace))?.id : undefined)
   try {
     const result = await $.mcp.call(name, tool, id ? { workspaceIdentifier: id, ...args } : args)
@@ -189,6 +233,8 @@ const isXcodeBuilding = async ($: EngineInterface, ids: readonly string[], isLoc
   if (ids.length === 0 || !(isLocallyBusy ?? (await isAnythingBuilding($)))) return false
   for (const id of ids) {
     const log = await xcode($, 'GetBuildLog', { severity: 'error', pattern: '^$' }, true, id)
+    // Held: the local look is all there is, and it says something builds.
+    if (log.isHeld === true) return true
     if (!log.isError && log.json?.buildIsRunning === true) return true
   }
 
@@ -203,7 +249,10 @@ const setStep = ($: EngineInterface, step: Setup['step'], over: Partial<Setup> =
 // The spinner steps only while something builds.
 const syncSpinner = async ($: EngineInterface) => {
   const isBusy =
-    (await read($, activities)).length > 0 || (await read($, isExternalBuild)) || (await read($, elsewhere)).length > 0
+    (await read($, activities)).length > 0 ||
+    (await read($, isExternalBuild)) ||
+    (await read($, elsewhere)).length > 0 ||
+    (await read($, xcodeRun)) !== null
   if (!isBusy) {
     spinner?.cancel()
     spinner = null
@@ -290,10 +339,15 @@ const readElsewhere = async ($: EngineInterface): Promise<readonly Elsewhere[]> 
 const startTimers = ($: EngineInterface) => {
   probeTimer ??= $.clock.every(3_000, () => {
     void (async () => {
-      if (WAITING.has((await read($, setup)).step)) await probe($)
+      const step = (await read($, setup)).step
+      if (WAITING.has(step)) await probe($)
+      // Held at setup: the mode may have changed since (no event says so), and
+      // asking whether a check would prompt raises no dialog.
+      else if (step === 'held' && (await mayCheck($, 'XcodeListWorkspaces'))) await probe($)
     })()
   })
   pollTimer ??= $.clock.every(TICK_MS, () => void tick($))
+  watchLaunchReport($)
 }
 
 // Nobody has used the session for a while: no more calls to Xcode or reads of
@@ -519,6 +573,7 @@ const probe = async ($: EngineInterface) => {
 
     if ((await connect($)) === null) return
     const listed = await xcode($, 'XcodeListWorkspaces', {}, false)
+    if (listed.isHeld === true) return void (await setStep($, 'held', { ...facts, isHeadlessCapable, message: null }))
     if (listed.isError && isAutoModeRefusal(listed.text)) return
     if (listed.isError) {
       const step = isApprovalRefusal(listed) ? 'approve' : isPermissionRefusal(listed) ? 'permission-off' : 'mcp-failed'
@@ -611,7 +666,7 @@ const refreshWorkspaces = async ($: EngineInterface) => {
 // session) and whether an app runs there: one started in Xcode is shown and
 // can be stopped from the band; one the band or Claude launched is forgotten
 // once it ends.
-const poll = async ($: EngineInterface) => {
+const poll = async ($: EngineInterface, isForced = false) => {
   if (isPolling || isWorking || (await read($, isHidden))) return
   if ((await read($, setup)).step !== 'ready' || (await read($, activities)).length > 0) return
   isPolling = true
@@ -624,7 +679,7 @@ const poll = async ($: EngineInterface) => {
     // A build starting shows within a tick: the local look is free, and Xcode
     // is asked only as a build starts and every few ticks while it runs.
     const isBusy = await isAnythingBuilding($)
-    const isAppTick = polls % APP_EVERY === 0
+    const isAppTick = isForced || polls % APP_EVERY === 0
     const isBuilding = !isBusy
       ? false
       : !wasAnythingBuilding || isAppTick
@@ -638,6 +693,8 @@ const poll = async ($: EngineInterface) => {
     }
     if (!isAppTick) return
 
+    // The window's run as the launch report has it (the workspace may be newer).
+    await syncXcodeRun($)
     let running: { workspaceId: string; pid: number | null } | null = null
     for (const id of watchedOf(ws)) {
       const launch = parseLaunch(await xcode($, 'GetConsoleOutput', { outputType: 'stdio', tailLimit: 1, pattern: '^$' }, true, id))
@@ -666,6 +723,73 @@ const poll = async ($: EngineInterface) => {
   } finally {
     isPolling = false
   }
+}
+
+// ── A run started in the Xcode window ───────────────────────────────────────
+
+// Xcode's launch report (see readLaunchReport), from the unified log: the
+// last half hour once, then as it is written. The log does the filtering, so
+// the stream is idle while Xcode launches nothing.
+const LAUNCH_REPORT = 'process == "Xcode" AND subsystem == "IDELaunchReport"'
+let report: LaunchReport = {}
+let isReportWatched = false
+
+const readReportLine = ($: EngineInterface, line: string) => {
+  if (!line.startsWith('{')) return false
+  try {
+    const entry = JSON.parse(line) as { eventMessage?: unknown; timestamp?: unknown }
+    const at = typeof entry.timestamp === 'string' ? logTimeOf(entry.timestamp) : null
+    if (typeof entry.eventMessage !== 'string' || at === null) return false
+    const next = readLaunchReport(report, entry.eventMessage, at)
+    if (next === report) return false
+    report = next
+    return true
+  } catch {
+    return false
+  }
+}
+
+const watchLaunchReport = ($: EngineInterface) => {
+  if (isReportWatched) return
+  isReportWatched = true
+  void (async () => {
+    const past = await sh($, ['/usr/bin/log', 'show', '--last', '30m', '--style', 'ndjson', '--predicate', LAUNCH_REPORT], 60_000)
+    for (const line of past.stdout.split('\n')) readReportLine($, line)
+    await syncXcodeRun($)
+    // The stream ends only with its child (killed, or the module unloading);
+    // a child that dies is started again, a few times at most.
+    for (let restarts = 0; restarts < 5; restarts++) {
+      let rest = ''
+      try {
+        const stream = $.process.spawn({ argv: ['/usr/bin/log', 'stream', '--style', 'ndjson', '--predicate', LAUNCH_REPORT] })
+        for await (const { stream: pipe, text } of stream) {
+          if (pipe !== 'stdout') continue
+          const lines = (rest + text).split('\n')
+          rest = lines.pop() ?? ''
+          let isChanged = false
+          for (const line of lines) isChanged = readReportLine($, line) || isChanged
+          if (isChanged) await syncXcodeRun($)
+        }
+      } catch {
+        // Cannot run here (no unified log): the band does without it.
+        return
+      }
+      await sh($, ['/bin/sleep', '5'], 10_000)
+    }
+  })()
+}
+
+// The band's picture of the run Xcode has under way for this project.
+const syncXcodeRun = async ($: EngineInterface) => {
+  const ws = await read($, workspace)
+  const found = ws === null ? null : xcodeRunOf(report, ws.scheme ?? null, await $.clock.now())
+  const window = ws === null ? undefined : watchedOf(ws).find(id => id.startsWith('windowtab-'))
+  const next: XcodeRun | null = found === null ? null : { ...found, workspaceId: window }
+  const before = await read($, xcodeRun)
+  if (JSON.stringify(before) === JSON.stringify(next)) return
+  await update($, xcodeRun, () => next)
+  await syncSpinner($)
+  if (next?.isLocked && before?.isLocked !== true) $.ui.toast(`Unlock ${next.destination ?? 'the device'} to launch the app.`)
 }
 
 // ── Band actions ────────────────────────────────────────────────────────────
@@ -700,6 +824,7 @@ const refusalNow = async ($: EngineInterface, kind: ActivityKind): Promise<strin
       projectPath: await projectPath($),
       active: await read($, active),
       launched: await read($, launched),
+      xcodeRun: await read($, xcodeRun),
     },
     kind,
   )
@@ -737,7 +862,7 @@ const act = async ($: EngineInterface, kind: 'run' | 'build' | 'test' | 'stop') 
     }
   }
   // Stop ends the app where it runs, which may be the Xcode app's window.
-  const target = kind === 'stop' ? (await read($, launched))?.workspaceId : undefined
+  const target = kind === 'stop' ? ((await read($, launched))?.workspaceId ?? (await read($, xcodeRun))?.workspaceId) : undefined
   const answer = await xcode($, TOOL[kind], {}, true, target)
   // Cancelled meanwhile: the band has moved on, and this answer is stale.
   if (cancelled.delete(activity.id)) return
@@ -773,11 +898,32 @@ const pick = async ($: EngineInterface, title: string) => {
   }
 }
 
+const CHECK_PRESSES = new Set<Action>(['connect', 'refresh', 'recheck', 'reconnect', 'use-xcode-mcp', 'approve', 'open-project'])
+
 const press = async ($: EngineInterface, action: Action, surface: Parameters<EngineInterface['ui']['copy']>[0]['surface']) => {
   await touch($)
+  const isCheck = CHECK_PRESSES.has(action)
+  if (isCheck) checking += 1
+  try {
+    await pressed($, action, surface)
+  } finally {
+    if (isCheck) checking -= 1
+  }
+}
+
+const pressed = async ($: EngineInterface, action: Action, surface: Parameters<EngineInterface['ui']['copy']>[0]['surface']) => {
   switch (action) {
+    case 'connect':
+      await setStep($, 'checking')
+      return probe($)
+    case 'resume':
+      // touch() above has started polling again; look at once rather than in 4 s.
+      await poll($, true)
+      return
     case 'refresh':
+      await refreshWorkspaces($)
       await loadDestinations($)
+      await poll($, true)
       return
     case 'open-in-xcode': {
       // The project in the Xcode app: its window becomes the workspace the
@@ -838,7 +984,7 @@ const press = async ($: EngineInterface, action: Action, surface: Parameters<Eng
 
 // What Claude's build must wait for: one the band started, or another
 // session's on this same checkout (one build folder, one Xcode workspace).
-const isHeld = async ($: EngineInterface): Promise<boolean> => {
+const mustClaudeWait = async ($: EngineInterface): Promise<boolean> => {
   if (await isBandBusy($)) return true
   const project = await projectPath($)
   if (project !== null && (await readElsewhere($)).some(x => x.project === project)) return true
@@ -850,12 +996,12 @@ const isHeld = async ($: EngineInterface): Promise<boolean> => {
 // Claude's build waits for those, so the two never collide.
 const waitForBand = async ($: EngineInterface, signal: AbortSignal): Promise<boolean> => {
   for (let i = 0; i < WAIT_LIMIT_S; i++) {
-    if (!(await isHeld($))) return true
+    if (!(await mustClaudeWait($))) return true
     if (signal.aborted) return false
     await sh($, ['/bin/sleep', '1'], 5_000)
   }
 
-  return !(await isHeld($))
+  return !(await mustClaudeWait($))
 }
 
 const STATE_TOOL = 'mcp__xcode-companion__band_state'
@@ -877,10 +1023,76 @@ const snapshot = async ($: EngineInterface): Promise<string> =>
       elsewhere: await read($, elsewhere),
       isPaused: await read($, isPaused),
       phase: await read($, phase),
+      xcodeRun: await read($, xcodeRun),
+      isHeld: await read($, isHeld),
+      permissionMode,
+      check: await $.tool
+        .check({ tool: `mcp__${(server ?? 'xcode').replace(/:/g, '_')}__GetConsoleOutput`, input: {} })
+        .catch((err: unknown) => ({ decision: 'error', reason: String(err) })),
     },
     null,
     2,
   )
+
+// The permission mode rides on every classic hook event: the band keeps the
+// latest, and checks on Xcode again when it no longer asks for them.
+const noteMode = async ($: EngineInterface, mode: unknown, from = 'classic') => {
+  if (typeof mode !== 'string') return
+  // A mode the engine reported outright: what the hint line implied is moot.
+  if (from === 'classic') leftMode = null
+  if (mode === permissionMode) return
+  permissionMode = mode
+  await update($, knownMode, () => mode)
+  // A mode that asks: held at once, not at the next check seconds later.
+  if (!UNASKED_MODES.has(mode)) {
+    if (!(await read($, isHeld)) && !(await mayCheck($, 'XcodeListWorkspaces'))) await update($, isHeld, () => true)
+    return
+  }
+  await update($, isHeld, () => false)
+  if ((await read($, setup)).step === 'held') await probe($)
+}
+
+// The terminal's hint line under the prompt never names the mode it is in.
+// As shift+tab switches, the line handed to the hook is the one drawn before:
+// it names the mode being left (`manual mode on · ? for shortcuts`, `accept
+// edits on (shift+tab to cycle)`, `plan mode on …`, `auto mode on …`). After
+// that the line reads `? for shortcuts` in manual mode and `(shift+tab to
+// cycle)` in every other, so the new mode is the one after the mode left, in
+// the order shift+tab walks them. Where that order skips a mode (auto or
+// bypass unavailable) the guess is still right about what matters here:
+// every mode past plan lets the checks through.
+const modeFromHint = (hint: string): string | null => {
+  if (/\bauto mode on\b/i.test(hint)) return 'auto'
+  if (/\bbypass permissions on\b/i.test(hint)) return 'bypassPermissions'
+  if (/\baccept edits on\b/i.test(hint)) return 'acceptEdits'
+  if (/\bplan mode on\b/i.test(hint)) return 'plan'
+  if (/\bmanual mode on\b/i.test(hint)) return 'default'
+  return null
+}
+
+const NEXT_MODE: Record<string, string> = {
+  default: 'acceptEdits',
+  acceptEdits: 'plan',
+  plan: 'auto',
+  auto: 'bypassPermissions',
+  bypassPermissions: 'auto',
+}
+
+// The mode the last shift+tab left, as its line named it; null until one has
+// (or once a classic event reported the mode outright).
+let leftMode: string | null = null
+
+// The mode a line drawn at rest says the session is in, or null when it cannot say.
+const modeAtRest = (hint: string): string | null => {
+  const left = modeFromHint(hint)
+  if (left !== null) {
+    leftMode = left
+    return null
+  }
+  if (/\?\s*for shortcuts/i.test(hint)) return 'default'
+  if (/\(shift\+tab to cycle\)/i.test(hint) && leftMode !== null) return NEXT_MODE[leftMode] ?? null
+  return null
+}
 
 // What the band shows when nothing beneath it draws: an empty Box (or nothing).
 const isEmptyBox = (tree: unknown): boolean => {
@@ -896,6 +1108,22 @@ const isEmptyBox = (tree: unknown): boolean => {
 }
 
 export const register: Register = on => {
+  on('classic.SessionStart', async ($, e, next) => {
+    const answer = await next(e)
+    await noteMode($, e.permission_mode)
+    return answer
+  })
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    const answer = await next(e)
+    await noteMode($, e.permission_mode)
+    return answer
+  })
+  on('classic.Stop', async ($, e, next) => {
+    const answer = await next(e)
+    await noteMode($, e.permission_mode)
+    return answer
+  })
+
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'xcode-companion-band', description: 'Show or hide the Xcode Companion band above the prompt' })
     await $.command.register({ name: 'xcode-companion-setup', description: 'Walk through the Xcode Companion setup again' })
@@ -914,6 +1142,11 @@ export const register: Register = on => {
     await update($, elsewhere, () => [])
     await update($, isPaused, () => false)
     await update($, phase, () => null)
+    await update($, xcodeRun, () => null)
+    await update($, isHeld, () => false)
+    // A reload keeps the session's state: the mode noted before it still holds,
+    // unless a classic event has named one since.
+    permissionMode ??= await read($, knownMode)
     // A result saved before runs read "Launched on …" says what happened, not what runs.
     await update($, last, (o: Outcome | null) =>
       o !== null && o.kind === 'run' && o.summary.startsWith('Running') ? { ...o, summary: o.summary.replace(/^Running/, 'Launched') } : o,
@@ -1016,7 +1249,7 @@ export const register: Register = on => {
     }
 
     // Stop never waits: it is how a run stuck on its device is ended.
-    if (kind !== 'stop' && (await isHeld($))) {
+    if (kind !== 'stop' && (await mustClaudeWait($))) {
       if (!(await waitForBand($, next.signal))) {
         return { deny: 'A build in Xcode, from the Xcode band or from another session on this checkout is still running. Wait for it to finish, then try again.' }
       }
@@ -1043,6 +1276,21 @@ export const register: Register = on => {
     }
   }).catch(($, e, next) => next(e))
 
+  // Reads the mode off the hint line as it is drawn; the band's own drawing
+  // follows once the switch is noted (a render may not write, a timer may).
+  // Reads the mode off the terminal's hint line (see modeAtRest); the band's
+  // own drawing follows once the switch is noted (a render may not write, a
+  // timer may). Typing and a turn draw other lines, which say nothing.
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    if (e.surface !== 'terminal' || e.props.isDraft || e.props.isWorking) return next(e)
+    const hint = e.props.hint
+    $.clock.after(0, () => {
+      const mode = modeAtRest(hint)
+      if (mode !== null) void noteMode($, mode, 'hint')
+    })
+    return next(e)
+  })
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || e.props.view.agentId !== undefined || (await read($, isHidden))) return next(e)
     const s = await read($, setup)
@@ -1068,6 +1316,8 @@ export const register: Register = on => {
       projectPath: ws?.path ?? (s.projects.length === 1 ? (s.projects[0] ?? null) : null),
       isPaused: await read($, isPaused),
       phase: await read($, phase),
+      xcodeRun: await read($, xcodeRun),
+      isHeld: await read($, isHeld),
       now: await $.clock.now(),
       spinner: SPINNER[step % SPINNER.length] ?? '',
     })
@@ -1112,6 +1362,19 @@ export const register: Register = on => {
                 <Text color="warning" wrap="wrap">
                   {view.note}
                 </Text>
+              ) : view.noteAction !== undefined ? (
+                // The note's own action, inline: part of the sentence, not a button row.
+                <Box key="xcode-note" gap={1} alignItems="center">
+                  <Text dimColor wrap="truncate">
+                    {view.note}
+                  </Text>
+                  <Button
+                    key={`xcode-${view.noteAction}`}
+                    label={ACTION_LABEL[view.noteAction]}
+                    plain
+                    onPress={() => void press($, view.noteAction ?? 'refresh', e.surface)}
+                  />
+                </Box>
               ) : (
                 <Text dimColor wrap="wrap">
                   {view.note}

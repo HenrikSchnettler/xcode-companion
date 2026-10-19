@@ -47,7 +47,8 @@ Setup goes one step at a time, with the button for that step:
   `xcodebuild`), the band, Xcode itself (a build you start in the Xcode window),
   or another session. A build started in Xcode shows within about a second.
 - **The phase of a run** — building, launching, or **waiting for a locked
-  device**: "Unlock *your iPhone* to launch *App*", with a toast.
+  device**: "Unlock *your iPhone* to launch *App*", with a toast. A run started
+  in the Xcode window shows too, with Stop, from Xcode's own launch log.
 - **Results that say what happened** — `Build failed · 2 errors`,
   `Tests failed · 2 of 40`, `Launched on …`, `App ended on …`. After a failure the
   band started, **Ask Claude to fix** puts the errors in the prompt (it never
@@ -116,10 +117,12 @@ itself. So the band polls, and keeps that cheap:
 | 8 s | Xcode window opened or closed? | `XcodeListWorkspaces` |
 | 16 s | Devices plugged in or out? | `XcodeListRunDestinations` |
 | 2 s, during a run | Building, launching, locked? | the build service; `devicectl … lockState` |
+| as Xcode logs it | A run from the Xcode window waiting on the device? | `log stream` on Xcode's launch report |
 
 Before every Run, Build or Test the band checks again, fresh, so an old picture
-never starts anything. After **10 idle minutes** it stops polling until you are
-back (a prompt, a press in the band, the session reopened).
+never starts anything. After **10 idle minutes** it stops polling and says so,
+with **Resume** right in that line; a prompt, any press in the band or the
+session reopened starts it again too.
 
 Xcode writes a file for many of its answers (a whole build log for
 `GetBuildLog`) and never removes it; the band removes the ones its own calls
@@ -139,21 +142,34 @@ tests/band.test.ts              # the band, driven through the engine
 
 ## Surface support and known issues
 
-- **Terminal**: everything works in every permission mode.
-- **Desktop app, auto mode**: the app refuses a mod's own MCP calls
-  ([anthropics/claude-code#101884](https://github.com/anthropics/claude-code/issues/101884)),
-  though the plugin API says they need no permission. The band says so and
-  points to the issue. Use another mode, or the terminal.
-- **Desktop app, manual mode**: the app asks for permission on the band's own
-  MCP calls, polling included. Allow the read-only ones
-  (`GetConsoleOutput`, `XcodeListWorkspaces`, `XcodeListRunDestinations`,
-  `GetBuildLog`), or use another mode or the terminal.
-- Cloud and remote sessions don't load plugins.
+The plugin API says a mod's own MCP calls need no permission. Claude Code does
+not always agree, so how live the band is depends on the permission mode:
+
+| Mode | Terminal | Desktop app |
+|---|---|---|
+| Bypass permissions | live | live |
+| Auto | live | refused, presses included ([anthropics/claude-code#101884](https://github.com/anthropics/claude-code/issues/101884)); the band says so once and stops asking |
+| Default, accept edits, plan | asks per call | asks per call |
+
+In a mode that would ask, the band **never raises a dialog by itself**. It
+shows **Connect to Xcode** (or "Live status off", with **Refresh** in that line) and checks
+on Xcode only when you press one of them. Run, Build and Test ask once, for the
+action itself, with no checks around it. Allow rules for the read-only tools
+(`GetConsoleOutput`, `XcodeListWorkspaces`, `XcodeListRunDestinations`,
+`GetBuildLog`, `XcodeCloseWorkspace`, `XcodeOpenWorkspace`) turn live status
+on in those modes too; they also let Claude use those tools without asking.
+
+In the terminal the band follows a **Shift+Tab** switch at once. In the desktop
+app it learns a new mode with your next prompt, or sooner when the mode is bypass.
+
+Cloud and remote sessions don't load plugins.
 
 ## What it touches on your Mac
 
 - Runs `pgrep`, `xcodebuild -version`, `xcrun` (`mcp-server status`,
   `devicectl … lockState`), `git rev-parse` and `open` (Xcode, the App Store).
+- Reads Xcode's launch log from the unified log (`log show`, then one `log
+  stream` for the session), filtered to the Xcode app's run steps.
 - Writes one small file per running build to `~/.claude/xcode-companion/busy/`
   and removes it when the build ends (stale ones are cleaned up by any session).
 - Removes the files Xcode writes for the band's own MCP calls, and only those,

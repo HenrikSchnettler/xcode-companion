@@ -17,6 +17,7 @@ export type SetupStep =
   | 'permission-off'
   | 'mcp-failed'
   | 'auto-mode'
+  | 'held'
   | 'approve'
   | 'open-project'
   | 'ready'
@@ -124,6 +125,21 @@ export type Launched = {
   pid?: number | null
 }
 
+/**
+ * A run started in the Xcode window, past its build, that has not launched
+ * the app yet, as Xcode's launch report tells it: preparing or installing on
+ * the device, launching, or waiting for it to be unlocked.
+ */
+export type XcodeRun = {
+  startedAtMs: number
+  destination: string | null
+  step: 'preparing' | 'installing' | 'launching' | 'locked'
+  /** Xcode waits for the device to be unlocked. */
+  isLocked: boolean
+  /** The workspace whose Stop ends it. */
+  workspaceId?: string
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'xcode-companion': {
@@ -140,7 +156,15 @@ declare module 'claude-code' {
       elsewhere: readonly Elsewhere[]
       /** Polling stopped after a while without anyone using the session. */
       isPaused: boolean
+      /** Checks on Xcode would ask for permission in this mode: the band holds them. */
+      isHeld: boolean
+      /**
+       * The session's permission mode as last reported (classic hook events, the
+       * terminal's hint line); kept here so a reload of the mod does not forget it.
+       */
+      permissionMode: string | null
       phase: RunPhase | null
+      xcodeRun: XcodeRun | null
     }
   }
 }
