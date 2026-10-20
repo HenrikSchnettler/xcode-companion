@@ -312,13 +312,19 @@ export const fmtAgo = (ms: number): string => {
 
 export const baseName = (path: string): string => (path.split('/').pop() ?? path).replace(/\.(xcodeproj|xcworkspace)$/, '')
 
-// A project's name in the picker; two of the same name (in different folders)
-// carry their folder too: `iOS/App`, `macOS/App`.
+// A project's name in the picker. Projects of the same name (in different
+// folders) carry as many of their folders as it takes to tell them apart:
+// `iOS/App`, `macOS/App`; `clients/iOS/App`, `products/iOS/App`.
 export const projectLabel = (path: string, all: readonly string[]): string => {
   const name = baseName(path)
-  if (all.filter(p => baseName(p) === name).length < 2) return name
-  const folder = path.split('/').slice(-2, -1)[0]
-  return folder === undefined || folder === '' ? name : `${folder}/${name}`
+  const folders = (p: string) => p.split('/').slice(0, -1).filter(x => x !== '')
+  const label = (p: string, n: number) => [...folders(p).slice(folders(p).length - n), name].join('/')
+  const others = all.filter(p => p !== path && baseName(p) === name)
+  const mine = folders(path)
+  for (let n = 0; n <= mine.length; n++) {
+    if (others.every(p => label(p, n) !== label(path, n))) return label(path, n)
+  }
+  return path
 }
 
 // ── What the band shows ─────────────────────────────────────────────────────

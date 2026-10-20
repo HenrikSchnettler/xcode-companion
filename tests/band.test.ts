@@ -5,7 +5,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
-import { outcomeOf, readAnswer, readLaunchReport, xcodeRunOf } from '../hooks/model'
+import { outcomeOf, projectLabel, readAnswer, readLaunchReport, xcodeRunOf } from '../hooks/model'
 
 const T0 = 1_800_000_000_000
 const SURFACES = ['terminal', 'desktop'] as const
@@ -455,6 +455,11 @@ test('several projects in subfolders: the picker names their folders when the na
   const labels = (picker?.props as { options: { label: string }[] }).options.map(o => o.label)
   expect(labels).toEqual(['iOS/App', 'macOS/App'])
   await ui.unmount()
+})
+
+test('picker labels carry as many folders as it takes to tell projects apart', () => {
+  const all = ['/p/clients/iOS/App.xcodeproj', '/p/products/iOS/App.xcodeproj', '/p/products/macOS/App.xcodeproj', '/p/tools/Kit.xcodeproj']
+  expect(all.map(p => projectLabel(p, all))).toEqual(['clients/iOS/App', 'products/iOS/App', 'macOS/App', 'Kit'])
 })
 
 test('a folder with only packages and no project draws nothing', async ($, on) => {
