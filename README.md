@@ -63,7 +63,9 @@ Setup goes one step at a time, with the button for that step:
 - **Headless or in the Xcode window** — with Xcode 27 the band works with Xcode
   closed (headless). Open the project in Xcode and the band moves to its window,
   so what it builds is what you see there; quit Xcode and it moves back.
-- **Guided setup** — the band finds the project and walks you through what is
+- **Guided setup** — the band finds the project (in the folder Claude Code was
+  opened in, or a few levels below it, such as an app beside its local
+  packages) and walks you through what is
   missing, one step and one button at a time: Xcode not installed or too old,
   `xcode-select` on the Command Line Tools, Xcode's MCP switched off, Xcode
   needing to be open (26.3), the approval dialog in Xcode, the project to open.

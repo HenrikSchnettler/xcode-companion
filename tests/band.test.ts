@@ -5,7 +5,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
-import { outcomeOf, readAnswer, readLaunchReport, xcodeRunOf } from '../hooks/model'
+import { outcomeOf, projectLabel, readAnswer, readLaunchReport, xcodeRunOf } from '../hooks/model'
 
 const T0 = 1_800_000_000_000
 const SURFACES = ['terminal', 'desktop'] as const
@@ -46,6 +46,8 @@ type Host = {
   /** What `$.mcp.connect('xcode')` answers. */
   connect: { isConnected: true; server: string } | { isConnected: false; reason: string; message: string }
   entries: { name: string; kind: 'dir' | 'file' }[]
+  /** Folders below the session's (`/p/…`): their entries; any other is empty. */
+  folders: Record<string, { name: string; kind: 'dir' | 'file' }[]>
   answers: Record<string, Json | ((args: Json) => Json | Promise<Json>)>
   errors: Record<string, string>
   /** Calls the engine refuses: `$.mcp.call` rejects with the reason. */
@@ -89,6 +91,7 @@ const host = (on: On, over: Partial<Host> = {}, store: Record<string, unknown> =
     isXcodeInstalled: true,
     connect: { isConnected: true, server: 'xcode' },
     entries: [{ name: 'App.xcodeproj', kind: 'dir' }],
+    folders: {},
     answers: {
       XcodeListWorkspaces: { message: `* workspaceIdentifier: workspace-1, workspacePath: ${PROJECT}` },
       XcodeListRunDestinations: DESTINATIONS,
@@ -133,7 +136,8 @@ const host = (on: On, over: Partial<Host> = {}, store: Record<string, unknown> =
       return { value: path.endsWith('Empty.xcodeproj') ? [] : [{ name: 'project.pbxproj', kind: 'file', size: 0 }] }
     }
     if (path.endsWith('.xcworkspace')) return { value: [{ name: 'contents.xcworkspacedata', kind: 'file', size: 0 }] }
-    return { value: seen.entries.map(x => ({ ...x, size: 0 })) }
+    const entries = path === '/p' ? seen.entries : (seen.folders[path] ?? [])
+    return { value: entries.map(x => ({ ...x, size: 0 })) }
   })
   on('prompt.fill', (_$, e) => {
     seen.fills.push(e.text)
@@ -400,6 +404,72 @@ test('an empty .xcodeproj left behind is no project', async ($, on) => {
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: 'App is ready to run' })).toBeDefined()
   expect(await ui.find({ key: 'xcode-project' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a project in a subfolder is found, beside its local packages', async ($, on) => {
+  const app = '/p/App/App.xcodeproj'
+  const { clock, seen } = host(on, {
+    entries: [
+      { name: 'App', kind: 'dir' },
+      { name: 'Packages', kind: 'dir' },
+      { name: 'node_modules', kind: 'dir' },
+      { name: '.build', kind: 'dir' },
+      { name: 'README.md', kind: 'file' },
+    ],
+    folders: {
+      '/p/App': [{ name: 'App.xcodeproj', kind: 'dir' }, { name: 'Sources', kind: 'dir' }],
+      '/p/Packages': [{ name: 'Core', kind: 'dir' }],
+      // Deeper than the app's own: never shadows it.
+      '/p/Packages/Core': [{ name: 'Demo.xcodeproj', kind: 'dir' }],
+      '/p/node_modules': [{ name: 'Other.xcodeproj', kind: 'dir' }],
+      '/p/.build': [{ name: 'Built.xcodeproj', kind: 'dir' }],
+    },
+  })
+  seen.answers.XcodeListWorkspaces = { message: `* workspaceIdentifier: workspace-1, workspacePath: ${app}` }
+  await start($, clock)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'App is ready to run' })).toBeDefined()
+  expect(await ui.find({ key: 'xcode-project' })).toBeUndefined()
+  await ui.unmount()
+  const answered = JSON.stringify(await $.tool.call({ tool: 'mcp__xcode-companion__band_state' } as never))
+  expect(answered).toContain(app)
+  expect(answered).not.toMatch(/Demo|Other|Built/)
+})
+
+test('several projects in subfolders: the picker names their folders when the names clash', async ($, on) => {
+  const { clock } = host(on, {
+    entries: [
+      { name: 'iOS', kind: 'dir' },
+      { name: 'macOS', kind: 'dir' },
+    ],
+    folders: {
+      '/p/iOS': [{ name: 'App.xcodeproj', kind: 'dir' }],
+      '/p/macOS': [{ name: 'App.xcodeproj', kind: 'dir' }],
+    },
+  })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Several Xcode projects here/ })).toBeDefined()
+  const picker = await ui.find({ key: 'xcode-project' })
+  const labels = (picker?.props as { options: { label: string }[] }).options.map(o => o.label)
+  expect(labels).toEqual(['iOS/App', 'macOS/App'])
+  await ui.unmount()
+})
+
+test('picker labels carry as many folders as it takes to tell projects apart', () => {
+  const all = ['/p/clients/iOS/App.xcodeproj', '/p/products/iOS/App.xcodeproj', '/p/products/macOS/App.xcodeproj', '/p/tools/Kit.xcodeproj']
+  expect(all.map(p => projectLabel(p, all))).toEqual(['clients/iOS/App', 'products/iOS/App', 'macOS/App', 'Kit'])
+})
+
+test('a folder with only packages and no project draws nothing', async ($, on) => {
+  const { clock } = host(on, {
+    entries: [{ name: 'Packages', kind: 'dir' }],
+    folders: { '/p/Packages': [{ name: 'Core', kind: 'dir' }], '/p/Packages/Core': [{ name: 'Sources', kind: 'dir' }] },
+  })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Xcode|ready/ })).toBeUndefined()
   await ui.unmount()
 })
 

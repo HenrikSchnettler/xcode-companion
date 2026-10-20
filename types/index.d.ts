@@ -31,7 +31,7 @@ export type Setup = {
   /** This Xcode serves MCP with the app closed (`xcrun mcp-server`). */
   isHeadlessCapable: boolean
   isXcodeOpen: boolean
-  /** The project files found in the session's folder, absolute. */
+  /** The project files found in the session's folder or the shallowest folder below it that has one, absolute. */
   projects: readonly string[]
   /** The approval dialog was asked for and not yet answered. */
   isApprovalAsked: boolean
