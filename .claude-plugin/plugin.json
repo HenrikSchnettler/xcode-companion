@@ -1,6 +1,6 @@
 {
   "name": "xcode-companion",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Xcode in Claude Code: a band above the prompt to build, run and test on a device or simulator, see when Claude, Xcode or another session is building, and get set up step by step, through Xcode's own MCP server.",
   "author": {
     "name": "Henrik Schnettler"
