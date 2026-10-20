@@ -334,6 +334,25 @@ test("another plugin's band below gets a rule between", async ($, on) => {
   }
 })
 
+test('our rule keeps its own key over a band beneath that has a rule keyed divider', async ($, on) => {
+  // A desktop refuses a tree that holds a key twice, and draws its own band instead.
+  const rule = { type: 'Markdown', props: { key: 'divider', text: '---' } }
+  const { clock } = host(on, {
+    below: {
+      type: 'Box',
+      props: { flexDirection: 'column' },
+      children: [{ type: 'Text', children: ['band one'] }, rule, { type: 'Text', children: ['band two'] }],
+    } as RenderElement,
+  })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: 'App is ready to run' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'band two' })).toBeDefined()
+  expect(await ui.findAll({ type: 'Markdown', text: '---' })).toHaveLength(2)
+  expect(await ui.find({ key: 'xcode-companion-divider' })).toBeDefined()
+  await ui.unmount()
+})
+
 function hostAnswers(): Record<string, Json> {
   return {
     XcodeListWorkspaces: { message: `* workspaceIdentifier: workspace-1, workspacePath: ${PROJECT}` },

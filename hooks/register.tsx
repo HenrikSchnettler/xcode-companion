@@ -1488,13 +1488,15 @@ export const register: Register = on => {
 
     // Another plugin's band follows ours: a thin rule keeps the two apart, at
     // the band's columns on a terminal, the surface's own rule elsewhere.
+    // Every band draws into one tree, and a desktop refuses a key drawn twice:
+    // the rule's key carries the plugin's name.
     return (
       <Box flexDirection="column">
         {ours}
         {isRoomy ? (
-          <Markdown key="xcode-divider" text="---" dimColor />
+          <Markdown key="xcode-companion-divider" text="---" dimColor />
         ) : (
-          <Text key="xcode-divider" dimColor wrap="truncate">
+          <Text key="xcode-companion-divider" dimColor wrap="truncate">
             {'─'.repeat(e.props.bodyColumns)}
           </Text>
         )}
