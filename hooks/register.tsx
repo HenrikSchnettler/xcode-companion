@@ -36,6 +36,7 @@ import {
   pickWorkspace,
   parseVersion,
   parseWorkspaces,
+  projectLabel,
   readAnswer,
   readLaunchReport,
   refusal,
@@ -499,33 +500,52 @@ const isBandBusy = async ($: EngineInterface) => (await read($, activities)).som
 
 // ── Setup ───────────────────────────────────────────────────────────────────
 
+// Folders that never hold the project: dependencies, build output, and bundles.
+const SKIPPED = new Set(['node_modules', 'Pods', 'Carthage', 'DerivedData', 'build', 'Build'])
+const BUNDLE = /\.(xcassets|lproj|app|appex|framework|xcframework|bundle|playground|docc|xcdatamodeld|scnassets|xctemplate)$/
+// How deep below the session's folder a project may sit (an app beside its
+// local packages: `App/App.xcodeproj`), and how many folders the search reads.
+const PROJECT_DEPTH = 3
+const PROJECT_FOLDERS = 200
+
 const findProjects = async ($: EngineInterface, cwd: string): Promise<string[]> => {
-  let entries: { name: string; kind: string }[] = []
-  try {
-    entries = await $.fs.list(cwd)
-  } catch {
-    return []
+  const list = async (dir: string) => {
+    try {
+      return await $.fs.list(dir)
+    } catch {
+      return []
+    }
   }
   // A bundle counts only with the file that makes it one: an empty
   // `.xcodeproj` left behind by a rename is no project to open.
-  const holds = async (dir: string, file: string) => {
-    try {
-      return (await $.fs.list(`${cwd}/${dir}`)).some(x => x.name === file)
-    } catch {
-      return false
-    }
-  }
-  const dirs = entries.filter(x => x.kind === 'dir').map(x => x.name)
-  const spaces: string[] = []
-  const projs: string[] = []
-  for (const n of dirs) {
-    if (n.endsWith('.xcworkspace') && (await holds(n, 'contents.xcworkspacedata'))) spaces.push(n)
-    else if (n.endsWith('.xcodeproj') && (await holds(n, 'project.pbxproj'))) projs.push(n)
-  }
-  // A workspace beside its project (CocoaPods and the like) is the one to open.
-  const projects = projs.filter(n => !spaces.includes(n.replace(/\.xcodeproj$/, '.xcworkspace')))
+  const holds = async (dir: string, file: string) => (await list(dir)).some(x => x.name === file)
 
-  return [...spaces, ...projects].sort().map(n => `${cwd}/${n}`)
+  // Level by level, and the shallowest level with a project wins: a sample
+  // project inside one of the local packages never shadows the app's own.
+  let level = [cwd]
+  let read = 0
+  for (let depth = 0; depth <= PROJECT_DEPTH && level.length > 0; depth++) {
+    const spaces: string[] = []
+    const projs: string[] = []
+    const below: string[] = []
+    for (const dir of level) {
+      if (read++ >= PROJECT_FOLDERS) break
+      const names = (await list(dir)).filter(x => x.kind === 'dir').map(x => x.name)
+      for (const n of names) {
+        const path = `${dir}/${n}`
+        if (n.endsWith('.xcworkspace')) {
+          if (await holds(path, 'contents.xcworkspacedata')) spaces.push(path)
+        } else if (n.endsWith('.xcodeproj')) {
+          if (await holds(path, 'project.pbxproj')) projs.push(path)
+        } else if (!n.startsWith('.') && !SKIPPED.has(n) && !BUNDLE.test(n)) below.push(path)
+      }
+    }
+    // A workspace beside its project (CocoaPods and the like) is the one to open.
+    const projects = projs.filter(p => !spaces.includes(p.replace(/\.xcodeproj$/, '.xcworkspace')))
+    if (spaces.length + projects.length > 0) return [...spaces, ...projects].sort()
+    level = below.sort()
+  }
+  return []
 }
 
 // Xcode's run destinations as one answer listed them: the picker's options and
@@ -1433,7 +1453,7 @@ export const register: Register = on => {
             <Select
               key="xcode-project"
               label="Project"
-              options={s.projects.map(p => ({ value: p, label: baseName(p) }))}
+              options={s.projects.map(p => ({ value: p, label: projectLabel(p, s.projects) }))}
               onSelect={value =>
                 void (async () => {
                   await touch($)

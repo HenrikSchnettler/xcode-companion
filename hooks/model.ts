@@ -312,6 +312,15 @@ export const fmtAgo = (ms: number): string => {
 
 export const baseName = (path: string): string => (path.split('/').pop() ?? path).replace(/\.(xcodeproj|xcworkspace)$/, '')
 
+// A project's name in the picker; two of the same name (in different folders)
+// carry their folder too: `iOS/App`, `macOS/App`.
+export const projectLabel = (path: string, all: readonly string[]): string => {
+  const name = baseName(path)
+  if (all.filter(p => baseName(p) === name).length < 2) return name
+  const folder = path.split('/').slice(-2, -1)[0]
+  return folder === undefined || folder === '' ? name : `${folder}/${name}`
+}
+
 // ── What the band shows ─────────────────────────────────────────────────────
 
 export type Action =

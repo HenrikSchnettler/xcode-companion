@@ -187,7 +187,10 @@ Established against Xcode 27.0 (`xcrun mcpbridge`, server `xcode-tools`):
 - **Artifacts**: every `full…Path` an own call leaves under `ActionArtifacts`
   is removed right away.
 - **Setup** (`probe`) walks the first unmet step each time: project file found
-  (a `.xcodeproj` counts only with its `project.pbxproj`), backend chosen,
+  (a `.xcodeproj` counts only with its `project.pbxproj`; searched in the
+  session's folder, then up to 3 levels below it, level by level, and the
+  shallowest level with a project wins; dependencies, build output, hidden
+  folders and bundles are skipped, and at most 200 folders are read), backend chosen,
   `mcpbridge` present (else Command Line Tools / too old / no Xcode), headless
   or app open, permission, MCP connected, approval, project open. Steps the
   person resolves outside the band are re-checked every 3 s.
