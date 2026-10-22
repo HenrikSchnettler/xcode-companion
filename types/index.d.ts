@@ -164,6 +164,11 @@ declare module 'claude-code' {
       /** Checks on Xcode would ask for permission in this mode: the band holds them. */
       isHeld: boolean
       /**
+       * The band's allow rules for Xcode's tools are in the user settings
+       * (Allow Xcode tools), a workaround until claude-code #101884 is fixed.
+       */
+      isAllowed: boolean
+      /**
        * The session's permission mode as last reported (classic hook events, the
        * terminal's hint line); kept here so a reload of the mod does not forget it.
        */

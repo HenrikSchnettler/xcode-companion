@@ -25,11 +25,13 @@ import {
   baseName,
   errorText,
   handOver,
+  hasBandRules,
   isApprovalRefusal,
   isAutoModeRefusal,
   isPermissionRefusal,
   isRunUncertain,
   logTimeOf,
+  mcpToolName,
   outcomeOf,
   parseDestinations,
   parseLaunch,
@@ -41,6 +43,7 @@ import {
   readLaunchReport,
   refusal,
   shellBuild,
+  withBandRules,
   xcodeRunOf,
   xcodeTool,
 } from './model'
@@ -71,6 +74,7 @@ const phase = atom({ plugin: 'xcode-companion', key: 'phase' } as const, null)
 const isHeld = atom({ plugin: 'xcode-companion', key: 'isHeld' } as const, false)
 const knownMode = atom({ plugin: 'xcode-companion', key: 'permissionMode' } as const, null)
 const xcodeRun = atom({ plugin: 'xcode-companion', key: 'xcodeRun' } as const, null)
+const isAllowed = atom({ plugin: 'xcode-companion', key: 'isAllowed' } as const, false)
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 const APP_STORE = 'macappstore://apps.apple.com/app/id497799835'
@@ -129,6 +133,8 @@ let phaseTimer: Timer | null = null
 const PHASE_MS = 2_000
 // The MCP server's name as `$.mcp.call` takes it, once connected.
 let server: string | null = null
+// The person's user settings file, where Allow Xcode tools writes its rules.
+let settingsFile: string | null = null
 
 const keyFor = (kind: string, path: string) => `${kind}:${path}`
 
@@ -145,8 +151,10 @@ const sh = async ($: EngineInterface, argv: string[], timeoutMs = 10_000) => {
 const connect = async ($: EngineInterface): Promise<string | null> => {
   if (server !== null) return server
   const r = await $.mcp.connect('xcode')
-  if (r.isConnected) server = r.server
-  else await setStep($, 'mcp-failed', { message: r.message })
+  if (r.isConnected) {
+    server = r.server
+    await syncAllowed($)
+  } else await setStep($, 'mcp-failed', { message: r.message })
 
   return server
 }
@@ -170,9 +178,8 @@ const UNASKED_MODES = new Set(['auto', 'bypassPermissions'])
 // not; the band never raises a dialog the person did not ask for.
 const mayCheck = async ($: EngineInterface, tool: string): Promise<boolean> => {
   if (checking > 0 || (permissionMode !== null && UNASKED_MODES.has(permissionMode))) return true
-  const name = `mcp__${(server ?? 'xcode').replace(/:/g, '_')}__${tool}`
   try {
-    return (await $.tool.check({ tool: name, input: {} })).decision === 'allow'
+    return (await $.tool.check({ tool: mcpToolName(server ?? 'xcode', tool), input: {} })).decision === 'allow'
   } catch {
     return false
   }
@@ -184,6 +191,7 @@ const POLLED = ['XcodeListWorkspaces', 'GetConsoleOutput', 'XcodeListRunDestinat
 // Held while any polled check would ask: asking costs no dialog, so this is
 // how live status comes back after a mode switch or a new allow rule.
 const syncHeld = async ($: EngineInterface) => {
+  await syncAllowed($)
   if (checking > 0) return
   let held = false
   for (const tool of POLLED) {
@@ -193,6 +201,56 @@ const syncHeld = async ($: EngineInterface) => {
     }
   }
   if (held !== (await read($, isHeld))) await update($, isHeld, () => held)
+}
+
+// The settings file as text; '' when there is none, null when it cannot be read.
+const readSettings = async ($: EngineInterface, file: string): Promise<string | null> => {
+  if (!(await $.fs.exists(file).catch(() => true))) return ''
+  try {
+    return await $.fs.read(file)
+  } catch {
+    return null
+  }
+}
+
+// Whether the band's allow rules are in the user settings: the person may
+// have added or removed them by hand meanwhile.
+const syncAllowed = async ($: EngineInterface) => {
+  if (settingsFile === null) return
+  const text = await readSettings($, settingsFile)
+  const allowed = text !== null && hasBandRules(text, server ?? 'xcode')
+  if (allowed !== (await read($, isAllowed))) await update($, isAllowed, () => allowed)
+}
+
+// Allow Xcode tools: the band's allow rules go into the person's user
+// settings, a workaround until claude-code #101884 is fixed. Claude Code then
+// runs the band's checks and actions unasked in every mode, the desktop app's
+// auto mode included, and Claude's calls to the same tools too. Only the
+// rules are added; a file that is not plain JSON is left alone.
+const allowTools = async ($: EngineInterface) => {
+  const name = await connect($)
+  if (name === null || settingsFile === null) return
+  const shown = settingsFile.replace(/^.*\/\.claude\//, '~/.claude/')
+  const text = await readSettings($, settingsFile)
+  const next = text === null ? null : withBandRules(text, name)
+  if (next === null) return void $.ui.toast(`Could not read ${shown} as JSON: nothing was changed.`)
+  if (next.added > 0) {
+    try {
+      await $.fs.write(settingsFile, next.text)
+    } catch (err) {
+      return void $.ui.toast(`Could not write ${shown}: ${String(err)}`)
+    }
+  }
+  await update($, isAllowed, () => true)
+  // Claude Code reads its settings again once the file changes.
+  await sh($, ['/bin/sleep', '1'], 5_000)
+  const step = (await read($, setup)).step
+  if (step === 'held' || step === 'auto-mode') await probe($)
+  else await syncHeld($)
+  const now = (await read($, setup)).step
+  if (now === 'auto-mode') return void $.ui.toast(`Allowed in ${shown}, but the desktop app still refuses the band in auto mode.`)
+  if (now === 'held' || (await read($, isHeld))) return void $.ui.toast(`Allowed in ${shown}: Claude Code has not applied it yet, so press Refresh in a moment.`)
+  $.ui.toast(`Allowed: the band and Claude use Xcode's tools without asking. The rules are in ${shown}.`)
 }
 
 // One call on Xcode's MCP server, aimed at the band's workspace unless told otherwise.
@@ -1030,6 +1088,8 @@ const pressed = async ($: EngineInterface, action: Action, surface: Parameters<E
       return act($, action)
     case 'cancel':
       return cancel($)
+    case 'allow-xcode':
+      return allowTools($)
     case 'hand-over': {
       const o = await read($, last)
       const ws = await read($, workspace)
@@ -1086,8 +1146,9 @@ const snapshot = async ($: EngineInterface): Promise<string> =>
       xcodeRun: await read($, xcodeRun),
       isHeld: await read($, isHeld),
       permissionMode,
+      isAllowed: await read($, isAllowed),
       check: await $.tool
-        .check({ tool: `mcp__${(server ?? 'xcode').replace(/:/g, '_')}__GetConsoleOutput`, input: {} })
+        .check({ tool: mcpToolName(server ?? 'xcode', 'GetConsoleOutput'), input: {} })
         .catch((err: unknown) => ({ decision: 'error', reason: String(err) })),
     },
     null,
@@ -1214,6 +1275,9 @@ export const register: Register = on => {
     // The registry other sessions read; without it the band still works, alone.
     try {
       const home = await $.env.get('HOME')
+      const configDir = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? (home ? `${home}/.claude` : null)
+      settingsFile = configDir === null ? null : `${configDir}/settings.json`
+      await syncAllowed($)
       sessionKey = await $.session.id()
       folder = await $.session.cwd()
       registry = home ? `${home}/.claude/xcode-companion/busy` : null
@@ -1378,6 +1442,7 @@ export const register: Register = on => {
       phase: await read($, phase),
       xcodeRun: await read($, xcodeRun),
       isHeld: await read($, isHeld),
+      isAllowed: await read($, isAllowed),
       now: await $.clock.now(),
       spinner: SPINNER[step % SPINNER.length] ?? '',
     })
@@ -1422,18 +1487,15 @@ export const register: Register = on => {
                 <Text color="warning" wrap="wrap">
                   {view.note}
                 </Text>
-              ) : view.noteAction !== undefined ? (
-                // The note's own action, inline: part of the sentence, not a button row.
+              ) : view.noteActions !== undefined ? (
+                // The note's own actions, inline: part of the sentence, not a button row.
                 <Box key="xcode-note" gap={1} alignItems="center">
                   <Text dimColor wrap="truncate">
                     {view.note}
                   </Text>
-                  <Button
-                    key={`xcode-${view.noteAction}`}
-                    label={ACTION_LABEL[view.noteAction]}
-                    plain
-                    onPress={() => void press($, view.noteAction ?? 'refresh', e.surface)}
-                  />
+                  {view.noteActions.map(action => (
+                    <Button key={`xcode-${action}`} label={ACTION_LABEL[action]} plain onPress={() => void press($, action, e.surface)} />
+                  ))}
                 </Box>
               ) : (
                 <Text dimColor wrap="wrap">

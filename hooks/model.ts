@@ -67,6 +67,56 @@ export const isAutoModeRefusal = (text: string): boolean => /auto mode classifie
 
 export const DESKTOP_BUG_URL = 'https://github.com/anthropics/claude-code/issues/101884'
 
+// ── Allow rules (until claude-code #101884 is fixed) ────────────────────────
+// Claude Code asks for a mod's own MCP calls in most modes, and the desktop
+// app's auto mode refuses them, though the plugin API says neither should
+// happen. An allow rule per tool in the person's settings lets them through.
+// Rules are keyed by the tool's name alone, so they let Claude use the same
+// tools without asking too.
+
+// The tools the band calls: its checks, its actions and the device switch.
+export const BAND_TOOLS = [
+  'GetBuildLog',
+  'GetConsoleOutput',
+  'XcodeListRunDestinations',
+  'XcodeListWorkspaces',
+  'XcodeOpenWorkspace',
+  'XcodeCloseWorkspace',
+  'XcodeSwitchRunDestination',
+  'BuildProject',
+  'RunProject',
+  'RunAllTests',
+  'StopProject',
+] as const
+
+// A tool's name as Claude Code's permissions spell it: `mcp__<server>__<tool>`.
+export const mcpToolName = (server: string, tool: string): string => `mcp__${server.replace(/[^\w-]/g, '_')}__${tool}`
+
+// A settings file's text with the band's rules added to `permissions.allow`,
+// every other key kept as it was; null when the text is not a JSON object of
+// that shape (nothing is written then). `added` counts the rules it lacked.
+export const withBandRules = (text: string, server: string): { text: string; added: number } | null => {
+  let settings: unknown
+  try {
+    settings = text.trim() === '' ? {} : JSON.parse(text)
+  } catch {
+    return null
+  }
+  const isObject = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+  if (!isObject(settings)) return null
+  const permissions = settings.permissions ?? {}
+  if (!isObject(permissions)) return null
+  const allow = permissions.allow ?? []
+  if (!Array.isArray(allow)) return null
+  const missing = BAND_TOOLS.map(t => mcpToolName(server, t)).filter(rule => !allow.includes(rule))
+  if (missing.length === 0) return { text, added: 0 }
+  const next = { ...settings, permissions: { ...permissions, allow: [...allow, ...missing] } }
+
+  return { text: `${JSON.stringify(next, null, 2)}\n`, added: missing.length }
+}
+
+export const hasBandRules = (text: string, server: string): boolean => withBandRules(text, server)?.added === 0
+
 export const isPermissionRefusal = (a: Answer): boolean =>
   /not (enabled|allowed)|turned off|disabled/i.test(a.text) && !isApprovalRefusal(a)
 
@@ -350,6 +400,7 @@ export type Action =
   | 'open-in-xcode'
   | 'connect'
   | 'resume'
+  | 'allow-xcode'
 
 export const ACTION_LABEL: Record<Action, string> = {
   'use-xcode-mcp': 'Use Xcode MCP',
@@ -372,6 +423,7 @@ export const ACTION_LABEL: Record<Action, string> = {
   'open-in-xcode': 'Open in Xcode',
   connect: 'Connect to Xcode',
   resume: 'Resume',
+  'allow-xcode': 'Allow Xcode tools',
 }
 
 export const SELECT_COMMAND = 'sudo xcode-select -s /Applications/Xcode.app'
@@ -385,8 +437,8 @@ export type BandView = {
   note: string | null
   /** The note asks the person to act (unlock the device): drawn in the warning color. */
   isNoteUrgent?: boolean
-  /** A small action drawn inline after the note, as part of its sentence. */
-  noteAction?: Action
+  /** Small actions drawn inline after the note, as part of its sentence. */
+  noteActions?: Action[]
   tone: Tone
   /** Drawn right, before the actions: the spinner and elapsed time. */
   busy: string | null
@@ -491,6 +543,8 @@ export type BandInput = {
   isPaused: boolean
   /** The band's own checks on Xcode would ask for permission: it holds them. */
   isHeld?: boolean
+  /** The band's allow rules are in the person's user settings (Allow Xcode tools). */
+  isAllowed?: boolean
   /**
    * Where Xcode does the band's work: the Xcode app's window for the project,
    * or the headless server, which builds with no window open.
@@ -544,7 +598,7 @@ const byLabel = (o: Outcome): string => {
   return o.kind === 'run' ? `launched ${who}` : who
 }
 
-const setupView = (s: Setup, project: string | null): BandView => {
+const setupView = (s: Setup, project: string | null, isAllowed = false): BandView => {
   const v = s.xcodeVersion ? `Xcode ${s.xcodeVersion}` : 'Xcode'
   const view = (headline: string, detail: string | null, actions: Action[], tone: Tone = 'warn'): BandView => ({
     headline,
@@ -593,8 +647,10 @@ const setupView = (s: Setup, project: string | null): BandView => {
     case 'held':
       return view(
         'Connect to Xcode',
-        'In this permission mode every check on Xcode asks first, so the band waits for you',
-        ['connect'],
+        isAllowed
+          ? 'In this permission mode every check on Xcode asks first, so the band waits for you'
+          : "In this permission mode every check on Xcode asks first · Allow Xcode tools lets the band and Claude use Xcode's status, build, run and test tools without asking (allow rules in your user settings)",
+        isAllowed ? ['connect'] : ['allow-xcode', 'connect'],
         'calm',
       )
     case 'mcp-failed':
@@ -602,8 +658,10 @@ const setupView = (s: Setup, project: string | null): BandView => {
     case 'auto-mode':
       return view(
         "The desktop app's auto mode blocks the band",
-        "A known bug (claude-code #101884): auto mode should let a mod's own Xcode calls through, and does in the terminal, but the desktop app refuses them · switch this session out of auto mode, or use the band in a terminal session, then check again",
-        ['recheck', 'open-issue'],
+        isAllowed
+          ? "A known bug (claude-code #101884): auto mode should let a mod's own Xcode calls through, and does in the terminal, but the desktop app refuses them, allow rules notwithstanding · switch this session out of auto mode, or use the band in a terminal session, then check again"
+          : "A known bug (claude-code #101884): auto mode should let a mod's own Xcode calls through, and does in the terminal, but the desktop app refuses them · Allow Xcode tools lets them through until it is fixed (allow rules in your user settings, for Claude's calls too)",
+        isAllowed ? ['recheck', 'open-issue'] : ['allow-xcode', 'recheck', 'open-issue'],
       )
     case 'approve':
       return view(
@@ -626,7 +684,7 @@ const setupView = (s: Setup, project: string | null): BandView => {
 }
 
 export const bandView = (i: BandInput): BandView => {
-  if (i.setup.step !== 'ready') return setupView(i.setup, i.project)
+  if (i.setup.step !== 'ready') return setupView(i.setup, i.project, i.isAllowed)
 
   const project = i.project ?? 'the app'
   const where = i.via === 'headless' ? 'Headless Xcode (no window)' : i.via === 'window' ? 'Xcode window' : null
@@ -793,7 +851,7 @@ export const bandView = (i: BandInput): BandView => {
     headline,
     detail,
     note: i.isHeld ? 'Live status off in this mode ·' : i.isPaused ? 'Paused while idle ·' : null,
-    noteAction: i.isHeld ? 'refresh' : i.isPaused ? 'resume' : undefined,
+    noteActions: i.isHeld ? (i.isAllowed ? ['refresh'] : ['allow-xcode', 'refresh']) : i.isPaused ? ['resume'] : undefined,
     tone,
     busy: null,
     waiting: null,

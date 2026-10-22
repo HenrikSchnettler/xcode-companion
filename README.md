@@ -150,17 +150,24 @@ not always agree, so how live the band is depends on the permission mode:
 | Mode | Terminal | Desktop app |
 |---|---|---|
 | Bypass permissions | live | live |
-| Auto | live | refused, presses included ([anthropics/claude-code#101884](https://github.com/anthropics/claude-code/issues/101884)); the band says so once and stops asking |
+| Auto | live | refused, presses included ([anthropics/claude-code#101884](https://github.com/anthropics/claude-code/issues/101884)); the band says so once and stops asking, and offers **Allow Xcode tools** |
 | Default, accept edits, plan | asks per call | asks per call |
 
 In a mode that would ask, the band **never raises a dialog by itself**. It
 shows **Connect to Xcode** (or "Live status off", with **Refresh** in that line) and checks
 on Xcode only when you press one of them. Run, Build and Test ask twice: once
 to check the picked device is still the one Xcode runs on, once for the action
-itself. Allow rules for all four read-only tools the polling uses
-(`GetConsoleOutput`, `XcodeListWorkspaces`, `XcodeListRunDestinations`,
-`GetBuildLog`) turn live status on in those modes too; they also let Claude use
-those tools without asking.
+itself.
+
+Until that is fixed, **Allow Xcode tools** (offered beside Connect, Refresh and
+the auto-mode notice) adds allow rules for the Xcode tools the band calls to
+your user settings (`~/.claude/settings.json`, `permissions.allow`): its
+read-only checks, opening and closing the project, the device switch, Build,
+Run, Test and Stop. With them the band polls live in every mode, and its
+presses no longer ask. Rules are keyed by the tool's name, so **Claude may then
+use those same tools without asking too**. The band only adds the rules, keeps
+everything else in the file, and leaves a file that is not plain JSON alone. To
+undo it, remove the `mcp__…xcode…__` entries from `permissions.allow`.
 
 In the terminal the band follows a **Shift+Tab** switch at once. In the desktop
 app it learns a new mode with your next prompt, or sooner when the mode is bypass.

@@ -130,6 +130,19 @@ Established against Xcode 27.0 (`xcrun mcpbridge`, server `xcode-tools`):
   (an allow rule for one tool) clears nothing; every 4th tick `syncHeld` asks
   `$.tool.check` for each (no dialog; it answers `allow` in bypass mode or
   under a rule), and the `held` setup step is re-checked every 3 s.
+- **Allow Xcode tools** (`allowTools`, `withBandRules`): a workaround until
+  #101884 is fixed. On the person's press it adds an allow rule per tool the
+  band calls (`BAND_TOOLS`, named by `mcpToolName` for the connected server)
+  to the user settings (`$CLAUDE_CONFIG_DIR` or `~/.claude`, `settings.json`;
+  `$.settings` is read only, so the file is read and written with `$.fs`),
+  keeping every other key and refusing a file that is not a plain JSON object.
+  Claude Code applies a changed settings file live, so the next `syncHeld` or
+  held probe goes live. `isAllowed` (rules all present) hides the button; it is
+  re-read with `syncHeld`. The rules let Claude use those tools unasked too,
+  which the setup text says before the press. Whether they let a mod's own
+  call past the desktop app's auto-mode classifier is not yet confirmed: if
+  not, `auto-mode` says so ("allow rules notwithstanding"). Remove all of this
+  once the bug is fixed.
 - Actions always go through: the press is the person's. Run, Build and Test
   also refresh the device list inside the press, held or not, so a run never
   lands on a destination Xcode moved to by itself; with no fresh answer they
