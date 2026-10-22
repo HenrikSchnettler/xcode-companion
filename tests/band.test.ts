@@ -5,7 +5,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
-import { outcomeOf, projectLabel, readAnswer, readLaunchReport, xcodeRunOf } from '../hooks/model'
+import { BAND_TOOLS, mcpToolName, outcomeOf, projectLabel, readAnswer, readLaunchReport, withBandRules, xcodeRunOf } from '../hooks/model'
 
 const T0 = 1_800_000_000_000
 const SURFACES = ['terminal', 'desktop'] as const
@@ -74,7 +74,16 @@ type Host = {
   registry: Map<string, string>
   /** Xcode's launch report as `log show` answers it: ndjson lines. */
   launchLog: string[]
+  /**
+   * The user settings file's text; null when there is none. A tool its allow
+   * list names is allowed, and passes the desktop app's auto mode too.
+   */
+  settings: string | null
+  /** The desktop app refuses the band in auto mode even under allow rules. */
+  isRuleIgnored: boolean
 }
+
+const SETTINGS = '/home/.claude/settings.json'
 
 const REGISTRY = '/home/.claude/xcode-companion/busy'
 
@@ -113,6 +122,8 @@ const host = (on: On, over: Partial<Host> = {}, store: Record<string, unknown> =
     decisions: {},
     registry: new Map(),
     launchLog: [],
+    settings: null,
+    isRuleIgnored: false,
     ...over,
   }
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -123,8 +134,10 @@ const host = (on: On, over: Partial<Host> = {}, store: Record<string, unknown> =
   on('ui.toast', () => ({ value: undefined }))
   on('ui.render', () => seen.below)
   on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home' : undefined }))
-  on('fs.read', (_$, e) => ({ value: seen.registry.get(e.path.replace(`${REGISTRY}/`, '')) ?? '' }))
+  on('fs.read', (_$, e) => ({ value: e.path === SETTINGS ? (seen.settings ?? '') : (seen.registry.get(e.path.replace(`${REGISTRY}/`, '')) ?? '') }))
+  on('fs.exists', (_$, e) => ({ value: e.path === SETTINGS ? seen.settings !== null : true }))
   on('fs.write', (_$, e) => {
+    if (e.path === SETTINGS) seen.settings = e.text
     if (e.path.startsWith(`${REGISTRY}/`)) seen.registry.set(e.path.replace(`${REGISTRY}/`, ''), e.text)
     return { value: undefined }
   })
@@ -177,10 +190,13 @@ const host = (on: On, over: Partial<Host> = {}, store: Record<string, unknown> =
   })
 
   on('mcp.connect', () => ({ value: seen.connect }) as never)
-  on('tool.check', (_$, e) => ({ decision: seen.decisions[String(e.tool).replace(/^mcp__\w+?__/, '')] ?? seen.decision }))
+  const isRuled = (tool: string) => seen.settings?.includes(`"${tool}"`) === true
+  on('tool.check', (_$, e) => ({
+    decision: isRuled(String(e.tool)) ? 'allow' : (seen.decisions[String(e.tool).replace(/^mcp__\w+?__/, '')] ?? seen.decision),
+  }))
   on('mcp.call', async (_$, e) => {
     seen.calls.push({ tool: e.tool, args: e.args, server: e.server })
-    const refused = seen.refusals[e.tool]
+    const refused = isRuled(`mcp__${e.server}__${e.tool}`) && !seen.isRuleIgnored ? undefined : seen.refusals[e.tool]
     if (refused !== undefined) return { deny: refused } as never
     const error = seen.errors[e.tool]
     if (error !== undefined) return { value: { content: [{ type: 'text', text: error }], isError: true } }
@@ -1499,4 +1515,97 @@ test('live status stays off while any polled check would still ask, though other
   await clock.advance(8_000)
   expect(await ui.find({ type: 'Text', text: /Live status off/ })).toBeUndefined()
   await ui.unmount()
+})
+
+// ── Allow Xcode tools (until claude-code #101884 is fixed) ──────────────────
+
+const AUTO_REFUSAL =
+  'The server-side auto mode classifier gave no verdict for mcp__xcode__XcodeListWorkspaces: the request that produced this action did not ask for one'
+const RULES = JSON.stringify({ permissions: { allow: BAND_TOOLS.map(t => `mcp__xcode__${t}`) } })
+
+test('Allow Xcode tools at Connect: the rules go into the user settings, and the band goes live', async ($, on) => {
+  const { clock, seen } = host(on, { decision: 'ask', settings: '{\n  "model": "opus",\n  "permissions": { "allow": ["Bash(ls:*)"] }\n}\n' })
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'Connect to Xcode' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Claude use Xcode's status, build, run and test tools without asking/ })).toBeDefined()
+  expect(await ui.find({ key: 'xcode-allow-xcode' })).toMatchObject({ props: { label: 'Allow Xcode tools' } })
+  await ui.press({ key: 'xcode-allow-xcode' })
+  const written = JSON.parse(seen.settings ?? '{}') as { model: string; permissions: { allow: string[] } }
+  expect(written.model).toBe('opus')
+  expect(written.permissions.allow).toEqual(['Bash(ls:*)', ...BAND_TOOLS.map(t => `mcp__xcode__${t}`)])
+  expect(await ui.find({ type: 'Text', text: 'App is ready to run' })).toBeDefined()
+  // Polling runs in this mode now, without a press.
+  const before = seen.calls.length
+  await clock.advance(20_000)
+  expect(seen.calls.slice(before).some(c => c.tool === 'GetConsoleOutput')).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /Live status off/ })).toBeUndefined()
+  expect(await ui.find({ key: 'xcode-allow-xcode' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('held while ready: Allow Xcode tools sits beside Refresh, and is gone once the rules are there', async ($, on) => {
+  const { clock, seen } = host(on)
+  seen.isBuildServiceBusy = false
+  await start($, clock)
+  seen.decision = 'ask'
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Live status off/ })).toBeDefined()
+  expect(await ui.find({ key: 'xcode-allow-xcode' })).toMatchObject({ props: { plain: true } })
+  expect(await ui.find({ key: 'xcode-refresh' })).toBeDefined()
+  // Added by hand meanwhile: seen within a few polls.
+  seen.settings = RULES
+  await clock.advance(8_000)
+  expect(await ui.find({ type: 'Text', text: /Live status off/ })).toBeUndefined()
+  expect(await ui.find({ key: 'xcode-allow-xcode' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test("the desktop app's auto-mode refusal offers Allow Xcode tools, which lets the band through", async ($, on) => {
+  const { clock, seen } = host(on, { refusals: { XcodeListWorkspaces: AUTO_REFUSAL } })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: "The desktop app's auto mode blocks the band" })).toBeDefined()
+  await ui.press({ key: 'xcode-allow-xcode' })
+  expect(seen.settings).toContain('"mcp__xcode__XcodeListWorkspaces"')
+  expect(await ui.find({ type: 'Text', text: 'App is ready to run' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('auto mode refusing the band with the rules in place: says so, and offers no Allow', async ($, on) => {
+  const { clock } = host(on, { settings: RULES, isRuleIgnored: true, refusals: { XcodeListWorkspaces: AUTO_REFUSAL } })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /allow rules notwithstanding/ })).toBeDefined()
+  expect(await ui.find({ key: 'xcode-allow-xcode' })).toBeUndefined()
+  expect(await ui.find({ key: 'xcode-recheck' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a user settings file that is not plain JSON is left alone', async ($, on) => {
+  const { clock, seen } = host(on, { decision: 'ask', settings: '{ "permissions": { "allow": [] }, // mine\n}' })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'xcode-allow-xcode' })
+  expect(seen.settings).toBe('{ "permissions": { "allow": [] }, // mine\n}')
+  expect(await ui.find({ type: 'Text', text: 'Connect to Xcode' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('withBandRules adds only what is missing, keeps the rest, and refuses odd shapes', () => {
+  expect(mcpToolName('plugin:xcode-companion:xcode', 'RunProject')).toBe('mcp__plugin_xcode-companion_xcode__RunProject')
+  const once = withBandRules('', 'xcode')
+  expect(once?.added).toBe(BAND_TOOLS.length)
+  expect(withBandRules(once?.text ?? '', 'xcode')).toEqual({ text: once?.text, added: 0 })
+  const partial = JSON.stringify({ permissions: { allow: ['mcp__xcode__GetBuildLog'], deny: ['Bash(rm:*)'] }, env: { A: '1' } })
+  const merged = JSON.parse(withBandRules(partial, 'xcode')?.text ?? '{}') as { permissions: { allow: string[]; deny: string[] }; env: unknown }
+  expect(merged.permissions.allow.filter(r => r === 'mcp__xcode__GetBuildLog')).toHaveLength(1)
+  expect(merged.permissions.deny).toEqual(['Bash(rm:*)'])
+  expect(merged.env).toEqual({ A: '1' })
+  expect(withBandRules('[]', 'xcode')).toBeNull()
+  expect(withBandRules('{"permissions": []}', 'xcode')).toBeNull()
+  expect(withBandRules('{"permissions": {"allow": "x"}}', 'xcode')).toBeNull()
+  expect(withBandRules('{ nope', 'xcode')).toBeNull()
 })
