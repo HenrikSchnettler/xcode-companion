@@ -5,7 +5,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
-import { BAND_TOOLS, mcpToolName, outcomeOf, projectLabel, readAnswer, readLaunchReport, withBandRules, xcodeRunOf } from '../hooks/model'
+import { BAND_TOOLS, mcpToolName, outcomeOf, projectLabel, readAnswer, readLaunchReport, settleReport, withBandRules, xcodeRunOf } from '../hooks/model'
 
 const T0 = 1_800_000_000_000
 const SURFACES = ['terminal', 'desktop'] as const
@@ -1477,6 +1477,112 @@ test('a run from the Xcode window waiting on a locked iPhone shows, with Stop al
   expect(await ui.find({ key: 'xcode-run' })).toBeUndefined()
   await ui.press({ key: 'xcode-stop' })
   expect(seen.calls.find(c => c.tool === 'StopProject')?.args.workspaceIdentifier).toBe('windowtab-9')
+  await ui.unmount()
+})
+
+// A run on an iPhone with Developer Mode off, as Xcode 27 logged it (ids
+// shortened, the trailing User Info cut): it fails at once, the step first,
+// then the run, each message spanning lines.
+const DEV_MODE_ERROR =
+  'Developer Mode disabled\nDomain: com.apple.dt.deviceprep\nCode: -28\nRecovery Suggestion: To use iPhone von Henrik for development, enable Developer Mode in Settings → Privacy & Security.\nUser Info: {\n    IDERunOperationFailingWorker = IDEInstallCoreDeviceWorker;\n}\n--'
+const DEV_MODE_RUN = [
+  'a2:a2: Start',
+  'a2:b2:Installing built products Start',
+  'App:Run:a2: Launch App',
+  'a2: Platform: iOS',
+  'a2: Device Identifier: 00008150-00027C1C3AF0401C',
+  'a2: Model: iPhone Air (iPhone18,4)',
+  `a2:b2:Installing built products: iPhone von Henrik is unpaired: ${DEV_MODE_ERROR}`,
+  `a2:b2:Installing built products Finished with error: ${DEV_MODE_ERROR}`,
+  `a2:a2: Finished with error: ${DEV_MODE_ERROR}`,
+]
+
+test('the launch report ends a run Xcode gives up on, with its reason, its device and what to do', () => {
+  let runs = {}
+  const seen: (string | null)[] = []
+  for (const line of DEV_MODE_RUN) {
+    runs = readLaunchReport(runs, line, T0)
+    seen.push(xcodeRunOf(runs, 'App', T0)?.destination ?? null)
+  }
+  // The model names the device until the device's own name comes; the failing step ends the run.
+  expect(seen).toEqual([null, null, null, null, null, 'iPhone Air', 'iPhone von Henrik', null, null])
+  const settled = settleReport(runs, 'App', T0)
+  expect(settled.runs).toEqual({})
+  expect(settled.failed).toMatchObject({
+    kind: 'run',
+    by: 'external',
+    isOk: false,
+    summary: 'Run failed · Developer Mode disabled',
+    destination: 'iPhone von Henrik',
+    hint: 'To use iPhone von Henrik for development, enable Developer Mode in Settings → Privacy & Security.',
+  })
+  // The run's own end alone ends it too; another scheme's band leaves the failure for its own.
+  const runOnly = [...DEV_MODE_RUN.slice(0, 6), DEV_MODE_RUN[8]].reduce((r, line) => readLaunchReport(r, line, T0), {})
+  expect(xcodeRunOf(runOnly, 'App', T0)).toBeNull()
+  expect(settleReport(runOnly, 'Other', T0)).toMatchObject({ runs: runOnly, failed: null })
+  expect(settleReport(runOnly, 'App', T0).failed?.issues).toEqual([
+    'Developer Mode disabled · To use iPhone von Henrik for development, enable Developer Mode in Settings → Privacy & Security.',
+  ])
+  // Stopped in Xcode: over, and nothing failed.
+  const started = DEV_MODE_RUN.slice(0, 6).reduce((r, line) => readLaunchReport(r, line, T0), {})
+  const cancelled = readLaunchReport(started, 'a2:a2: Finished with error: The operation was cancelled.', T0)
+  expect(settleReport(cancelled, 'App', T0)).toEqual({ runs: {}, failed: null })
+})
+
+test('a run whose end the band missed: preparing and silent for long is over, waiting for an unlock is not', () => {
+  const preparing = LOCKED_RUN.slice(0, 5).reduce((r, line) => readLaunchReport(r, line, T0), {})
+  const locked = LOCKED_RUN.reduce((r, line) => readLaunchReport(r, line, T0), {})
+  expect(xcodeRunOf(preparing, 'App', T0 + 10 * 60_000)?.step).toBe('preparing')
+  // Progress lines keep it alive.
+  const progress = readLaunchReport(preparing, 'a1:b1:Installing built products: Waiting for device unavailability condition to be resolved: My iPhone: Copying OS library symbols from My iPhone (5%)', T0 + 10 * 60_000)
+  expect(xcodeRunOf(progress, 'App', T0 + 20 * 60_000)?.step).toBe('preparing')
+  expect(xcodeRunOf(preparing, 'App', T0 + 20 * 60_000)).toBeNull()
+  expect(settleReport(preparing, 'App', T0 + 20 * 60_000).runs).toEqual({})
+  expect(xcodeRunOf(locked, 'App', T0 + 60 * 60_000)?.step).toBe('locked')
+  // A Stop pressed on it: gone, whatever Xcode logs.
+  expect(settleReport(locked, 'App', T0, T0).runs).toEqual({})
+})
+
+test('a run from the Xcode window that fails on the device: the band says why and what to do, and offers Run again', async ($, on) => {
+  const stamp = new Date(T0 - 30_000).toISOString().replace('T', ' ').replace('Z', '+0000')
+  const { clock } = host(on, {
+    answers: { ...hostAnswers(), XcodeListWorkspaces: TWO_OPEN, GetConsoleOutput: launchOf('expired') },
+    isBuildServiceBusy: false,
+    launchLog: DEV_MODE_RUN.map(eventMessage => JSON.stringify({ eventMessage, timestamp: stamp })),
+  })
+  await start($, clock)
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Preparing/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'Run failed · Developer Mode disabled' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /enable Developer Mode in Settings → Privacy & Security/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /started in Xcode/ })).toBeDefined()
+  expect(await ui.find({ key: 'xcode-run' })).toBeDefined()
+  // Not the band's run: nothing to hand over to Claude.
+  expect(await ui.find({ key: 'xcode-hand-over' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('Stop on a run from the Xcode window whose end the band missed clears it', async ($, on) => {
+  const stamp = new Date(T0 - 30_000).toISOString().replace('T', ' ').replace('Z', '+0000')
+  const { clock, seen } = host(on, {
+    // Xcode has nothing under way to stop.
+    answers: { ...hostAnswers(), XcodeListWorkspaces: TWO_OPEN, GetConsoleOutput: launchOf('expired') },
+    errors: { StopProject: 'No run to stop.' },
+    isBuildServiceBusy: false,
+    launchLog: LOCKED_RUN.slice(0, 5).map(eventMessage => JSON.stringify({ eventMessage, timestamp: stamp })),
+  })
+  await start($, clock)
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'Xcode: Preparing My iPhone' })).toBeDefined()
+  await ui.press({ key: 'xcode-stop' })
+  expect(seen.calls.find(c => c.tool === 'StopProject')?.args.workspaceIdentifier).toBe('windowtab-9')
+  expect(await ui.find({ type: 'Text', text: /Preparing/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'App is ready to run' })).toBeDefined()
+  // And it stays gone on the next polls.
+  await clock.advance(8_000)
+  expect(await ui.find({ type: 'Text', text: /Preparing/ })).toBeUndefined()
   await ui.unmount()
 })
 

@@ -467,30 +467,79 @@ export type BandView = {
 //   <run>:<step>:Launching <app>: <device> is locked, waiting for unlock: …
 //   <run>:<step>:Launching <app> Finished       launched (or given up)
 //   <run>:<run>: Finished                       the run is over
+// A run Xcode gives up on ends instead, the step that failed first:
+//   <run>:<step>:Installing built products: <device> is unpaired: Developer Mode disabled …
+//   <run>:<step>:Installing built products Finished with error: <reason>
+//   <run>:<run>: Finished with error: <reason>
+// Such a message spans lines: the reason first, then `Domain:`, `Code:` and
+// often `Recovery Suggestion: <what to do>`. Every pattern reads the first
+// line; the suggestion is looked for in the rest. Lines naming the device's
+// `Model:` (and `Device Identifier:`, a UDID) follow the run's Launch line.
 
 export type ReportStep = XcodeRun['step']
-export type ReportRun = { startedAtMs: number; scheme: string | null; device: string | null; step: ReportStep }
+export type ReportFailure = { reason: string; suggestion: string | null; atMs: number }
+export type ReportRun = {
+  startedAtMs: number
+  /** The last line that told of it: a run silent for long is one whose end the band missed. */
+  lastAtMs: number
+  scheme: string | null
+  device: string | null
+  /** The device's model (`iPhone Air`), named before the device itself is. */
+  model: string | null
+  step: ReportStep
+  /** Xcode ended the run with an error: it is over, and the band says why. */
+  failure?: ReportFailure
+}
 export type LaunchReport = Readonly<Record<string, ReportRun>>
+
+// What a `Finished with error:` message says: its first line, and the
+// suggestion Xcode adds to it, both in one line.
+const failureOf = (reason: string, message: string, atMs: number): ReportFailure => {
+  const oneLine = (s: string) => {
+    const t = s.trim().replace(/\s+/g, ' ')
+    return t.length > 160 ? `${t.slice(0, 159)}…` : t
+  }
+  const suggestion = /^Recovery Suggestion: (.+)$/m.exec(message)?.[1]
+
+  return { reason: oneLine(reason), suggestion: suggestion ? oneLine(suggestion) : null, atMs }
+}
 
 // One line of the launch report applied to the runs it tells of.
 export const readLaunchReport = (runs: LaunchReport, message: string, atMs: number): LaunchReport => {
   const set = (id: string, change: Partial<ReportRun>): LaunchReport =>
-    runs[id] === undefined ? runs : { ...runs, [id]: { ...runs[id], ...change } }
+    runs[id] === undefined ? runs : { ...runs, [id]: { ...runs[id], ...change, lastAtMs: atMs } }
   const drop = (id: string): LaunchReport => {
     if (runs[id] === undefined) return runs
     const { [id]: _, ...rest } = runs
     return rest
   }
+  // The step that failed tells first; the run's own end repeats it.
+  const fail = (id: string, reason: string): LaunchReport => {
+    const run = runs[id]
+    if (run === undefined || run.failure !== undefined) return runs
+    // Stopped in Xcode, as its Stop does: over, and no failure of the app's.
+    if (/cancel/i.test(reason)) return drop(id)
+    return set(id, { failure: failureOf(reason, message, atMs) })
+  }
+  const line = message.split('\n')[0] ?? ''
   let m: RegExpExecArray | null
-  if ((m = /^([0-9a-f]+):\1: Start$/.exec(message))) return { ...runs, [m[1]]: { startedAtMs: atMs, scheme: null, device: null, step: 'preparing' } }
-  if ((m = /^([0-9a-f]+):\1: Finished$/.exec(message))) return drop(m[1])
-  if ((m = /^(.+):Run:([0-9a-f]+): Launch /.exec(message))) return set(m[2], { scheme: m[1] })
-  if ((m = /^([0-9a-f]+):[0-9a-f]+:Installing built products: Waiting for device unavailability condition to be resolved: (.+?): /.exec(message)))
+  if ((m = /^([0-9a-f]+):\1: Start$/.exec(line)))
+    return { ...runs, [m[1]]: { startedAtMs: atMs, lastAtMs: atMs, scheme: null, device: null, model: null, step: 'preparing' } }
+  if ((m = /^([0-9a-f]+):\1: Finished$/.exec(line))) return drop(m[1])
+  if ((m = /^([0-9a-f]+):[0-9a-f]+: ?(?:Installing built products |Launching .+ )?Finished with error: (.*)$/.exec(line))) return fail(m[1], m[2])
+  if ((m = /^(.+):Run:([0-9a-f]+): Launch /.exec(line))) return set(m[2], { scheme: m[1] })
+  if ((m = /^([0-9a-f]+): Model: (.+?)(?: \([^)]*\))?$/.exec(line))) return set(m[1], { model: m[2] })
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Installing built products: Waiting for device unavailability condition to be resolved: (.+?): /.exec(line)))
     return set(m[1], { step: 'preparing', device: m[2] })
-  if ((m = /^([0-9a-f]+):[0-9a-f]+:Installing built products: Installing on (.+?):?$/.exec(message))) return set(m[1], { step: 'installing', device: m[2] })
-  if ((m = /^([0-9a-f]+):[0-9a-f]+:Launching .+?: (.+) is locked, waiting for unlock/.exec(message))) return set(m[1], { step: 'locked', device: m[2] })
-  if ((m = /^([0-9a-f]+):[0-9a-f]+:Launching .+ Start$/.exec(message))) return set(m[1], { step: 'launching' })
-  if ((m = /^([0-9a-f]+):[0-9a-f]+:Launching .+ Finished$/.exec(message))) return drop(m[1])
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Installing built products: Installing on (.+?):?$/.exec(line))) return set(m[1], { step: 'installing', device: m[2] })
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Launching .+?: (.+) is locked, waiting for unlock/.exec(line))) return set(m[1], { step: 'locked', device: m[2] })
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Launching .+ Start$/.exec(line))) return set(m[1], { step: 'launching' })
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Launching .+ Finished$/.exec(line))) return drop(m[1])
+  // The device in trouble, by name: `<device> is unpaired: …`, `<device> is unavailable. …`.
+  if ((m = /^([0-9a-f]+):[0-9a-f]+:Installing built products: (.{1,80}?) is \w/.exec(line)))
+    return runs[m[1]]?.device ? set(m[1], {}) : set(m[1], { device: m[2] })
+  // Any other line of a run (progress, a step starting): it is alive.
+  if ((m = /^([0-9a-f]+):/.exec(line)) && runs[m[1]] !== undefined) return set(m[1], {})
 
   return runs
 }
@@ -505,17 +554,76 @@ export const logTimeOf = (stamp: string): number | null => {
   return Date.UTC(y, mo - 1, d, h, mi, sec, ms) - offset
 }
 
+// How long a run may be under way before the band takes it for one whose end
+// it missed: three hours at most, and a quarter of an hour without a line of
+// the report, unless it waits for an unlock (which says nothing until then).
+// Preparing a device logs progress every few seconds; its quietest stretch
+// seen (extracting the OS's symbols) lasted three minutes.
+export const STALE_RUN_MS = 3 * 3_600_000
+export const QUIET_RUN_MS = 15 * 60_000
+
+const isOfScheme = (run: ReportRun, scheme: string | null) => run.scheme !== null && (scheme === null || run.scheme === scheme)
+
+const isStale = (run: ReportRun, now: number, staleMs: number) =>
+  now - run.startedAtMs > staleMs || (run.step !== 'locked' && now - run.lastAtMs > Math.min(staleMs, QUIET_RUN_MS))
+
 // A run Xcode has under way for this scheme, past its build and before the
-// app launched; the newest when there are more. One older than `staleMs` is
-// one whose end the band missed.
-export const xcodeRunOf = (runs: LaunchReport, scheme: string | null, now: number, staleMs = 3 * 3_600_000): Omit<XcodeRun, 'workspaceId'> | null => {
+// app launched; the newest when there are more. A stale one is not.
+export const xcodeRunOf = (runs: LaunchReport, scheme: string | null, now: number, staleMs = STALE_RUN_MS): Omit<XcodeRun, 'workspaceId'> | null => {
   let found: ReportRun | null = null
   for (const run of Object.values(runs)) {
-    if (run.scheme === null || (scheme !== null && run.scheme !== scheme) || now - run.startedAtMs > staleMs) continue
+    if (!isOfScheme(run, scheme) || run.failure !== undefined || isStale(run, now, staleMs)) continue
     if (found === null || run.startedAtMs > found.startedAtMs) found = run
   }
 
-  return found === null ? null : { startedAtMs: found.startedAtMs, destination: found.device, step: found.step, isLocked: found.step === 'locked' }
+  return found === null
+    ? null
+    : { startedAtMs: found.startedAtMs, destination: found.device ?? found.model, step: found.step, isLocked: found.step === 'locked' }
+}
+
+// The report without what the band is done with: this scheme's runs that
+// failed (their newest failure returned, as a result for the band), runs
+// stale by now, and, for a Stop pressed on a run, this scheme's runs that
+// started by `stoppedAtMs`. Another scheme's failures stay for its band.
+export const settleReport = (
+  runs: LaunchReport,
+  scheme: string | null,
+  now: number,
+  stoppedAtMs: number | null = null,
+  staleMs = STALE_RUN_MS,
+): { runs: LaunchReport; failed: Outcome | null } => {
+  const kept: Record<string, ReportRun> = {}
+  let failed: ReportRun | null = null
+  let isChanged = false
+  for (const [id, run] of Object.entries(runs)) {
+    const isOurs = isOfScheme(run, scheme)
+    if (isOurs && run.failure !== undefined && (failed === null || run.startedAtMs > failed.startedAtMs)) failed = run
+    const isDone =
+      now - run.startedAtMs > staleMs ||
+      (run.failure === undefined && isStale(run, now, staleMs)) ||
+      (isOurs && (run.failure !== undefined || (stoppedAtMs !== null && run.startedAtMs <= stoppedAtMs)))
+    if (isDone) isChanged = true
+    else kept[id] = run
+  }
+
+  return { runs: isChanged ? kept : runs, failed: failed === null ? null : failedRunOutcome(failed) }
+}
+
+// A run Xcode gave up on, as the band's last result: what failed, on which
+// device, and what Xcode suggests doing about it.
+export const failedRunOutcome = (run: ReportRun): Outcome => {
+  const f = run.failure ?? { reason: 'Xcode ended the run with an error', suggestion: null, atMs: run.lastAtMs }
+  return {
+    kind: 'run',
+    by: 'external',
+    isOk: false,
+    summary: `Run failed · ${f.reason}`,
+    issues: [f.suggestion ? `${f.reason} · ${f.suggestion}` : f.reason],
+    destination: run.device ?? run.model,
+    atMs: f.atMs,
+    durationMs: f.atMs - run.startedAtMs,
+    ...(f.suggestion ? { hint: f.suggestion } : {}),
+  }
 }
 
 // Whether a run of `scheme` may be another window's: another open project of
@@ -594,8 +702,9 @@ export const conflictsOf = (i: Pick<BandInput, 'elsewhere' | 'projectPath' | 'ac
 
 const byLabel = (o: Outcome): string => {
   const who = o.by === 'band' ? 'from the band' : o.by === 'claude' ? 'by Claude' : 'in Xcode'
-  // A launch says who launched it: who ended it the band cannot know.
-  return o.kind === 'run' ? `launched ${who}` : who
+  // A launch says who launched it: who ended it the band cannot know. A run
+  // that failed launched nothing.
+  return o.kind === 'run' ? `${o.isOk ? 'launched' : 'started'} ${who}` : who
 }
 
 const setupView = (s: Setup, project: string | null, isAllowed = false): BandView => {
@@ -795,6 +904,8 @@ export const bandView = (i: BandInput): BandView => {
   const detail = facts(i.last || isRunningNow ? project : null, lastFacts, started, i.launched && !isRunningNow && i.last?.kind !== 'run' ? 'app running' : null)
   const canHandOver = i.last !== null && !i.last.isOk && i.last.by === 'band' && i.last.issues.length > 0
   const stop: Action[] = i.launched ? ['stop'] : []
+  // What Xcode suggests about the failure shown (enable Developer Mode …).
+  const hint = !isRunningNow && i.last !== null && !i.last.isOk ? (i.last.hint ?? null) : null
 
   // The app runs: Stop is the one thing to do. Running or testing again
   // would replace it, and the device it runs on is not the band's to change.
@@ -819,7 +930,8 @@ export const bandView = (i: BandInput): BandView => {
     return {
       headline,
       detail,
-      note: null,
+      note: hint,
+      isNoteUrgent: hint !== null,
       tone,
       busy: null,
       waiting: 'Available when Claude is done',
@@ -850,7 +962,8 @@ export const bandView = (i: BandInput): BandView => {
   return {
     headline,
     detail,
-    note: i.isHeld ? 'Live status off in this mode ·' : i.isPaused ? 'Paused while idle ·' : null,
+    note: i.isHeld ? 'Live status off in this mode ·' : i.isPaused ? 'Paused while idle ·' : hint,
+    isNoteUrgent: !i.isHeld && !i.isPaused && hint !== null,
     noteActions: i.isHeld ? (i.isAllowed ? ['refresh'] : ['allow-xcode', 'refresh']) : i.isPaused ? ['resume'] : undefined,
     tone,
     busy: null,
