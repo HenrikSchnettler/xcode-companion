@@ -90,6 +90,8 @@ export type Outcome = {
   durationMs: number | null
   /** For a launch: when the app was seen to end (stopped in Xcode, closed on the device). */
   endedAtMs?: number
+  /** What Xcode suggests doing about a failure (`enable Developer Mode …`), shown under it. */
+  hint?: string
 }
 
 /**

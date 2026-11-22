@@ -96,7 +96,12 @@ Established against Xcode 27.0 (`xcrun mcpbridge`, server `xcode-tools`):
   Waiting for device unavailability condition to be resolved: <device>: …`,
   `Installing on <device>:`, `Launching <app> Start`, `Launching <app>: <device>
   is locked, waiting for unlock`, `Launching <app> Finished`, `<run>:<run>:
-  Finished`. The band reads the last half hour once (`log show --style
+  Finished`. A run Xcode gives up on (Developer Mode off, an unpaired or
+  unregistered device) ends instead with `<run>:<step>:Installing built
+  products Finished with error: <reason>` and `<run>:<run>: Finished with
+  error: <reason>`, messages spanning lines (`Domain:`, `Code:`, `Recovery
+  Suggestion: …`); `<run>: Model: iPhone Air (…)` and `Device Identifier:` (a
+  UDID) follow the Launch line. The band reads the last half hour once (`log show --style
   ndjson`, about two seconds) and then follows `log stream` with the same
   predicate, which is idle while Xcode launches nothing. DerivedData's
   `Logs/Launch` does not help: Xcode records the run as finished before the
@@ -193,7 +198,16 @@ Established against Xcode 27.0 (`xcrun mcpbridge`, server `xcode-tools`):
   another scheme, or older than three hours, is not the band's. The report
   names only the scheme: while another window holds a project of the same
   name or one named like the scheme (a worktree), or before the windows were
-  first listed, the run is `isUncertain` and shown without Stop.
+  first listed, the run is `isUncertain` and shown without Stop. A run that
+  ends `Finished with error` becomes the last result (`Run failed · <reason>`,
+  Xcode's recovery suggestion as the note; `cancel…` reasons are a plain end),
+  unless it may be another window's (then it is not shown) and only once the
+  windows were first listed; a newer run of the scheme from Xcode (its Launch
+  line, or the app seen launched) makes such a failure past. A run silent for
+  15 minutes (unless it waits for an unlock) is taken as one whose end was
+  missed. Stop on a run forgets it once Xcode took the Stop in (`isHeardByXcode`:
+  answered, even "nothing to stop"), not when it never got there or Xcode
+  refused the agent.
 - **Results** say what happened (`Launched on …`), never what is (`Running on`
   comes only from a live launch session). A launch that ends is marked
   `App ended`, with who launched it and when it ended; who ended it is unknown.
