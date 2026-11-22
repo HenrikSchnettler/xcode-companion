@@ -8,7 +8,14 @@ import type { Activity, ActivityKind, Actor, Destination, Elsewhere, Launched, O
 
 // ── Reading Xcode's MCP answers ─────────────────────────────────────────────
 
-export type Answer = { json: Record<string, unknown> | null; text: string; isError: boolean; isHeld?: true }
+export type Answer = {
+  json: Record<string, unknown> | null
+  text: string
+  isError: boolean
+  isHeld?: true
+  /** The call never reached Xcode: not connected, or refused before it was sent (permissions, a timeout). */
+  isUnsent?: true
+}
 
 // An MCP result (or a tool.call result carrying one) as text plus its JSON.
 export const readAnswer = (result: unknown, isError = false): Answer => {
@@ -119,6 +126,12 @@ export const hasBandRules = (text: string, server: string): boolean => withBandR
 
 export const isPermissionRefusal = (a: Answer): boolean =>
   /not (enabled|allowed)|turned off|disabled/i.test(a.text) && !isApprovalRefusal(a)
+
+// Whether Xcode took a call in: it answered, and not to refuse the agent (not
+// approved, agents turned off). An error otherwise is Xcode's about the call
+// itself (a Stop with nothing to stop, say).
+export const isHeardByXcode = (a: Answer): boolean =>
+  a.isUnsent !== true && a.isHeld !== true && (!a.isError || (!isApprovalRefusal(a) && !isPermissionRefusal(a)))
 
 export type OpenWorkspace = { id: string; path: string }
 
@@ -527,7 +540,14 @@ export const readLaunchReport = (runs: LaunchReport, message: string, atMs: numb
     return { ...runs, [m[1]]: { startedAtMs: atMs, lastAtMs: atMs, scheme: null, device: null, model: null, step: 'preparing' } }
   if ((m = /^([0-9a-f]+):\1: Finished$/.exec(line))) return drop(m[1])
   if ((m = /^([0-9a-f]+):[0-9a-f]+: ?(?:Installing built products |Launching .+ )?Finished with error: (.*)$/.exec(line))) return fail(m[1], m[2])
-  if ((m = /^(.+):Run:([0-9a-f]+): Launch /.exec(line))) return set(m[2], { scheme: m[1] })
+  if ((m = /^(.+):Run:([0-9a-f]+): Launch /.exec(line))) {
+    const [, scheme, id] = m
+    const run = runs[id]
+    if (run === undefined) return runs
+    // A newer run of the scheme: an earlier one's failure is past.
+    const rest = Object.entries(runs).filter(([other, r]) => other === id || r.failure === undefined || r.scheme !== scheme || r.startedAtMs > run.startedAtMs)
+    return { ...Object.fromEntries(rest), [id]: { ...run, scheme, lastAtMs: atMs } }
+  }
   if ((m = /^([0-9a-f]+): Model: (.+?)(?: \([^)]*\))?$/.exec(line))) return set(m[1], { model: m[2] })
   if ((m = /^([0-9a-f]+):[0-9a-f]+:Installing built products: Waiting for device unavailability condition to be resolved: (.+?): /.exec(line)))
     return set(m[1], { step: 'preparing', device: m[2] })
@@ -584,20 +604,20 @@ export const xcodeRunOf = (runs: LaunchReport, scheme: string | null, now: numbe
 // The report without what the band is done with: this scheme's runs that
 // failed (their newest failure returned, as a result for the band), runs
 // stale by now, and, for a Stop pressed on a run, this scheme's runs that
-// started by `stoppedAtMs`. Another scheme's failures stay for its band.
+// started by `stoppedAtMs`. Another scheme's failures stay for its band. When
+// the scheme's runs may be another window's (`isUncertain`), their failures
+// are not this band's to show: they go, unshown.
 export const settleReport = (
   runs: LaunchReport,
-  scheme: string | null,
-  now: number,
-  stoppedAtMs: number | null = null,
-  staleMs = STALE_RUN_MS,
+  o: { scheme: string | null; now: number; stoppedAtMs?: number | null; isUncertain?: boolean; staleMs?: number },
 ): { runs: LaunchReport; failed: Outcome | null } => {
+  const { scheme, now, stoppedAtMs = null, isUncertain = false, staleMs = STALE_RUN_MS } = o
   const kept: Record<string, ReportRun> = {}
   let failed: ReportRun | null = null
   let isChanged = false
   for (const [id, run] of Object.entries(runs)) {
     const isOurs = isOfScheme(run, scheme)
-    if (isOurs && run.failure !== undefined && (failed === null || run.startedAtMs > failed.startedAtMs)) failed = run
+    if (isOurs && !isUncertain && run.failure !== undefined && (failed === null || run.startedAtMs > failed.startedAtMs)) failed = run
     const isDone =
       now - run.startedAtMs > staleMs ||
       (run.failure === undefined && isStale(run, now, staleMs)) ||
@@ -625,6 +645,13 @@ export const failedRunOutcome = (run: ReportRun): Outcome => {
     ...(f.suggestion ? { hint: f.suggestion } : {}),
   }
 }
+
+// The last result once a newer run started in Xcode (preparing, or the app
+// launched) at `atMs`: an earlier failure of a run from Xcode is past, and its
+// advice (enable Developer Mode …) no longer holds. The band's own failures
+// stay, for the hand-over to Claude.
+export const pastFailure = (o: Outcome | null, atMs: number): Outcome | null =>
+  o !== null && o.kind === 'run' && o.by === 'external' && !o.isOk && o.atMs < atMs ? null : o
 
 // Whether a run of `scheme` may be another window's: another open project of
 // the same name (a worktree), or one named like the scheme. Unknown windows

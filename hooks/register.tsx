@@ -40,6 +40,8 @@ import {
   parseWorkspaces,
   projectLabel,
   readAnswer,
+  isHeardByXcode,
+  pastFailure,
   readLaunchReport,
   refusal,
   settleReport,
@@ -264,7 +266,7 @@ const xcode = async (
   target?: string,
 ): Promise<Answer> => {
   const name = await connect($)
-  if (name === null) return { json: null, text: "Xcode's MCP server is not connected.", isError: true }
+  if (name === null) return { json: null, text: "Xcode's MCP server is not connected.", isError: true, isUnsent: true }
   if (CHECKS.has(tool)) {
     const may = await mayCheck($, tool)
     // One check that may run says nothing of the others: live status comes
@@ -283,7 +285,7 @@ const xcode = async (
     // The desktop app's auto mode refuses a mod's own call (a known bug): the
     // band says so instead of failing on every press.
     if (isAutoModeRefusal(text)) await setStep($, 'auto-mode', { message: text })
-    return { json: null, text, isError: true }
+    return { json: null, text, isError: true, isUnsent: true }
   }
 }
 
@@ -825,6 +827,8 @@ const poll = async ($: EngineInterface, isForced = false) => {
       const found = running
       const destination = activeOf(await xcode($, 'XcodeListRunDestinations', {}, true, found.workspaceId))
       await update($, launched, () => ({ destination, atMs: now, by: 'external', workspaceId: found.workspaceId, pid: found.pid }))
+      // Launched from Xcode: a failure of an earlier run from there is past.
+      await update($, last, (o: Outcome | null) => pastFailure(o, now))
     }
     if (polls % DEVICES_EVERY === 0 && !isBuilding) await loadDestinations($)
   } finally {
@@ -883,18 +887,21 @@ const watchLaunchReport = ($: EngineInterface) => {
       }
       await sh($, ['/bin/sleep', '5'], 10_000)
     }
-  })()
+    // The module unloads under it (a reload, the session ending): nothing to tell.
+  })().catch(() => undefined)
 }
 
 // The band's picture of the run Xcode has under way for this project. A run
 // Xcode gave up on becomes the last result (unless a newer one is there), and
 // leaves the report; so does one stale by now, or, after a Stop pressed on
-// it, the run stopped (`stoppedAtMs`, when it started).
+// it, the run stopped (`stoppedAtMs`, when it started). Until the windows are
+// first listed, whose a run is cannot be told: the report waits.
 const syncXcodeRun = async ($: EngineInterface, stoppedAtMs: number | null = null) => {
   const ws = await read($, workspace)
   const now = await $.clock.now()
-  if (ws !== null) {
-    const settled = settleReport(report, ws.scheme ?? null, now, stoppedAtMs)
+  const isUncertain = ws === null || isRunUncertain(otherWindows, ws.path, ws.scheme ?? null)
+  if (ws !== null && otherWindows !== null) {
+    const settled = settleReport(report, { scheme: ws.scheme ?? null, now, stoppedAtMs, isUncertain })
     report = settled.runs
     const failed = settled.failed
     if (failed !== null) {
@@ -908,8 +915,9 @@ const syncXcodeRun = async ($: EngineInterface, stoppedAtMs: number | null = nul
   }
   const found = ws === null ? null : xcodeRunOf(report, ws.scheme ?? null, now)
   const window = ws === null ? undefined : watchedOf(ws).find(id => id.startsWith('windowtab-'))
-  const isUncertain = ws === null || isRunUncertain(otherWindows, ws.path, ws.scheme ?? null)
   const next: XcodeRun | null = found === null ? null : { ...found, workspaceId: window, isUncertain }
+  // A newer run from Xcode under way: an earlier one's failure is past.
+  if (next !== null && !isUncertain) await update($, last, (o: Outcome | null) => pastFailure(o, next.startedAtMs))
   const before = await read($, xcodeRun)
   if (JSON.stringify(before) === JSON.stringify(next)) return
   await update($, xcodeRun, () => next)
@@ -1004,9 +1012,10 @@ const act = async ($: EngineInterface, kind: 'run' | 'build' | 'test' | 'stop') 
   // Cancelled meanwhile: the band has moved on, and this answer is stale.
   if (cancelled.delete(activity.id)) return
   await finish($, activity, answer)
-  // A Stop pressed on Xcode's run ends it, or finds none (one whose end the
-  // band missed): either way it is over, though Xcode logs no end for it.
-  if (kind === 'stop' && app === null && run !== null && !run.isUncertain) await syncXcodeRun($, run.startedAtMs)
+  // A Stop Xcode took in ends its run, or finds none (one whose end the band
+  // missed): either way it is over, though Xcode logs no end for it. A Stop
+  // that never reached Xcode (refused, not approved) leaves it under way.
+  if (kind === 'stop' && app === null && run !== null && !run.isUncertain && isHeardByXcode(answer)) await syncXcodeRun($, run.startedAtMs)
   if (kind === 'stop' && answer.isError) $.ui.toast(`Xcode: ${errorText(answer)}`)
   await loadDestinations($)
 }

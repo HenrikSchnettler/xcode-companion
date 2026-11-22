@@ -5,7 +5,19 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
-import { BAND_TOOLS, mcpToolName, outcomeOf, projectLabel, readAnswer, readLaunchReport, settleReport, withBandRules, xcodeRunOf } from '../hooks/model'
+import {
+  BAND_TOOLS,
+  isHeardByXcode,
+  mcpToolName,
+  outcomeOf,
+  pastFailure,
+  projectLabel,
+  readAnswer,
+  readLaunchReport,
+  settleReport,
+  withBandRules,
+  xcodeRunOf,
+} from '../hooks/model'
 
 const T0 = 1_800_000_000_000
 const SURFACES = ['terminal', 'desktop'] as const
@@ -1506,7 +1518,7 @@ test('the launch report ends a run Xcode gives up on, with its reason, its devic
   }
   // The model names the device until the device's own name comes; the failing step ends the run.
   expect(seen).toEqual([null, null, null, null, null, 'iPhone Air', 'iPhone von Henrik', null, null])
-  const settled = settleReport(runs, 'App', T0)
+  const settled = settleReport(runs, { scheme: 'App', now: T0 })
   expect(settled.runs).toEqual({})
   expect(settled.failed).toMatchObject({
     kind: 'run',
@@ -1519,14 +1531,53 @@ test('the launch report ends a run Xcode gives up on, with its reason, its devic
   // The run's own end alone ends it too; another scheme's band leaves the failure for its own.
   const runOnly = [...DEV_MODE_RUN.slice(0, 6), DEV_MODE_RUN[8]].reduce((r, line) => readLaunchReport(r, line, T0), {})
   expect(xcodeRunOf(runOnly, 'App', T0)).toBeNull()
-  expect(settleReport(runOnly, 'Other', T0)).toMatchObject({ runs: runOnly, failed: null })
-  expect(settleReport(runOnly, 'App', T0).failed?.issues).toEqual([
+  expect(settleReport(runOnly, { scheme: 'Other', now: T0 })).toMatchObject({ runs: runOnly, failed: null })
+  expect(settleReport(runOnly, { scheme: 'App', now: T0 }).failed?.issues).toEqual([
     'Developer Mode disabled · To use iPhone von Henrik for development, enable Developer Mode in Settings → Privacy & Security.',
   ])
   // Stopped in Xcode: over, and nothing failed.
   const started = DEV_MODE_RUN.slice(0, 6).reduce((r, line) => readLaunchReport(r, line, T0), {})
   const cancelled = readLaunchReport(started, 'a2:a2: Finished with error: The operation was cancelled.', T0)
-  expect(settleReport(cancelled, 'App', T0)).toEqual({ runs: {}, failed: null })
+  expect(settleReport(cancelled, { scheme: 'App', now: T0 })).toEqual({ runs: {}, failed: null })
+})
+
+// A run from the Xcode window that launches the app, after the failed one.
+const GOOD_RUN = [
+  'a3:a3: Start',
+  'a3:b3:Installing built products Start',
+  'App:Run:a3: Launch App',
+  'a3:b3:Installing built products: Installing on iPhone von Henrik:',
+  'a3:b3:Installing built products Finished',
+  'a3:c3:Launching App Start',
+  'a3:c3:Launching App: Successfully launched App:',
+  'a3:c3:Launching App Finished',
+  'a3:a3: Finished',
+]
+
+test("a failure is past once a newer run of the scheme starts, and another window's is not the band's", () => {
+  const failed = DEV_MODE_RUN.reduce((r, line) => readLaunchReport(r, line, T0), {})
+  // The next run's Launch line: the earlier failure goes, the new run stays.
+  const again = GOOD_RUN.slice(0, 3).reduce((r, line) => readLaunchReport(r, line, T0 + 60_000), failed)
+  expect(Object.keys(again)).toEqual(['a3'])
+  expect(settleReport(again, { scheme: 'App', now: T0 + 60_000 }).failed).toBeNull()
+  // Another scheme's newer run leaves it.
+  const other = ['a4:a4: Start', 'Other:Run:a4: Launch Other'].reduce((r, line) => readLaunchReport(r, line, T0 + 60_000), failed)
+  expect(settleReport(other, { scheme: 'App', now: T0 + 60_000 }).failed?.summary).toBe('Run failed · Developer Mode disabled')
+  // Maybe another window's: gone, unshown.
+  expect(settleReport(failed, { scheme: 'App', now: T0, isUncertain: true })).toEqual({ runs: {}, failed: null })
+  // The last result as a newer run starts: only an earlier failure from Xcode goes.
+  const fromXcode = settleReport(failed, { scheme: 'App', now: T0 }).failed
+  expect(pastFailure(fromXcode, T0 + 1)).toBeNull()
+  expect(pastFailure(fromXcode, T0 - 1)).toBe(fromXcode)
+  const fromBand = outcomeOf('run', 'band', readAnswer({ buildErrors: ['x.swift:1: oops'] }), 'My iPhone', T0, 1_000)
+  expect(pastFailure(fromBand, T0 + 1)).toBe(fromBand)
+})
+
+test('a Stop counts as taken in by Xcode unless it never got there or Xcode refused the agent', () => {
+  expect(isHeardByXcode(readAnswer({ stopResult: 'Stopped.' }))).toBe(true)
+  expect(isHeardByXcode(readAnswer({ content: [{ type: 'text', text: 'No run to stop.' }], isError: true }))).toBe(true)
+  expect(isHeardByXcode(readAnswer({ content: [{ type: 'text', text: "This agent isn't approved to use Xcode." }], isError: true }))).toBe(false)
+  expect(isHeardByXcode({ json: null, text: 'Permission denied', isError: true, isUnsent: true })).toBe(false)
 })
 
 test('a run whose end the band missed: preparing and silent for long is over, waiting for an unlock is not', () => {
@@ -1537,10 +1588,10 @@ test('a run whose end the band missed: preparing and silent for long is over, wa
   const progress = readLaunchReport(preparing, 'a1:b1:Installing built products: Waiting for device unavailability condition to be resolved: My iPhone: Copying OS library symbols from My iPhone (5%)', T0 + 10 * 60_000)
   expect(xcodeRunOf(progress, 'App', T0 + 20 * 60_000)?.step).toBe('preparing')
   expect(xcodeRunOf(preparing, 'App', T0 + 20 * 60_000)).toBeNull()
-  expect(settleReport(preparing, 'App', T0 + 20 * 60_000).runs).toEqual({})
+  expect(settleReport(preparing, { scheme: 'App', now: T0 + 20 * 60_000 }).runs).toEqual({})
   expect(xcodeRunOf(locked, 'App', T0 + 60 * 60_000)?.step).toBe('locked')
   // A Stop pressed on it: gone, whatever Xcode logs.
-  expect(settleReport(locked, 'App', T0, T0).runs).toEqual({})
+  expect(settleReport(locked, { scheme: 'App', now: T0, stoppedAtMs: T0 }).runs).toEqual({})
 })
 
 test('a run from the Xcode window that fails on the device: the band says why and what to do, and offers Run again', async ($, on) => {
@@ -1560,6 +1611,77 @@ test('a run from the Xcode window that fails on the device: the band says why an
   expect(await ui.find({ key: 'xcode-run' })).toBeDefined()
   // Not the band's run: nothing to hand over to Claude.
   expect(await ui.find({ key: 'xcode-hand-over' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a failure from the Xcode window is past once the next run from there launches, and stays so when the app ends', async ($, on) => {
+  const stamp = new Date(T0 - 30_000).toISOString().replace('T', ' ').replace('Z', '+0000')
+  const { clock, seen } = host(on, {
+    answers: { ...hostAnswers(), XcodeListWorkspaces: TWO_OPEN, GetConsoleOutput: launchOf('expired') },
+    isBuildServiceBusy: false,
+    launchLog: DEV_MODE_RUN.map(eventMessage => JSON.stringify({ eventMessage, timestamp: stamp })),
+  })
+  await start($, clock)
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'Run failed · Developer Mode disabled' })).toBeDefined()
+  // Developer Mode on, run again in Xcode: it launches.
+  seen.answers.GetConsoleOutput = launchOf('running', 3100)
+  await clock.advance(8_000)
+  expect(await ui.find({ type: 'Text', text: /^Running on/ })).toBeDefined()
+  // The app quits: the old failure does not come back.
+  seen.answers.GetConsoleOutput = launchOf('expired', 3100)
+  await clock.advance(16_000)
+  expect(await ui.find({ type: 'Text', text: /Run failed|Developer Mode/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'App is ready to run' })).toBeDefined()
+  await ui.unmount()
+})
+
+test("a failure the log's last half hour shows, with a successful run after it, is not shown at start", async ($, on) => {
+  const stamp = new Date(T0 - 300_000).toISOString().replace('T', ' ').replace('Z', '+0000')
+  const { clock } = host(on, {
+    answers: { ...hostAnswers(), XcodeListWorkspaces: TWO_OPEN, GetConsoleOutput: launchOf('expired') },
+    isBuildServiceBusy: false,
+    launchLog: [...DEV_MODE_RUN, ...GOOD_RUN].map(eventMessage => JSON.stringify({ eventMessage, timestamp: stamp })),
+  })
+  await start($, clock)
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Run failed|Developer Mode/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'App is ready to run' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a failure from the Xcode window that another window may own is not shown as the band\'s', async ($, on) => {
+  const stamp = new Date(T0 - 30_000).toISOString().replace('T', ' ').replace('Z', '+0000')
+  const withWorktree = { message: `${TWO_OPEN.message}\n* workspaceIdentifier: windowtab-7, workspacePath: /w/App.xcodeproj` }
+  const { clock } = host(on, {
+    answers: { ...hostAnswers(), XcodeListWorkspaces: withWorktree, GetConsoleOutput: launchOf('expired') },
+    isBuildServiceBusy: false,
+    launchLog: DEV_MODE_RUN.map(eventMessage => JSON.stringify({ eventMessage, timestamp: stamp })),
+  })
+  await start($, clock)
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Run failed|Developer Mode/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('Stop on a run from the Xcode window that never reaches Xcode leaves the run shown', async ($, on) => {
+  const stamp = new Date(T0 - 30_000).toISOString().replace('T', ' ').replace('Z', '+0000')
+  const { clock, seen } = host(on, {
+    answers: { ...hostAnswers(), XcodeListWorkspaces: TWO_OPEN, GetConsoleOutput: launchOf('expired') },
+    refusals: { StopProject: 'Permission to use StopProject has been denied.' },
+    isBuildServiceBusy: false,
+    launchLog: LOCKED_RUN.slice(0, 5).map(eventMessage => JSON.stringify({ eventMessage, timestamp: stamp })),
+  })
+  await start($, clock)
+  await clock.advance(8_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'xcode-stop' })
+  expect(seen.calls.some(c => c.tool === 'StopProject')).toBe(true)
+  expect(await ui.find({ type: 'Text', text: 'Xcode: Preparing My iPhone' })).toBeDefined()
+  expect(await ui.find({ key: 'xcode-run' })).toBeUndefined()
   await ui.unmount()
 })
 

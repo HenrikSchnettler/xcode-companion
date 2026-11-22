@@ -200,9 +200,14 @@ Established against Xcode 27.0 (`xcrun mcpbridge`, server `xcode-tools`):
   name or one named like the scheme (a worktree), or before the windows were
   first listed, the run is `isUncertain` and shown without Stop. A run that
   ends `Finished with error` becomes the last result (`Run failed · <reason>`,
-  Xcode's recovery suggestion as the note; `cancel…` reasons are a plain end);
-  one silent for 15 minutes (unless it waits for an unlock) is taken as one
-  whose end was missed, and Stop on a run forgets it whatever Xcode answers.
+  Xcode's recovery suggestion as the note; `cancel…` reasons are a plain end),
+  unless it may be another window's (then it is not shown) and only once the
+  windows were first listed; a newer run of the scheme from Xcode (its Launch
+  line, or the app seen launched) makes such a failure past. A run silent for
+  15 minutes (unless it waits for an unlock) is taken as one whose end was
+  missed. Stop on a run forgets it once Xcode took the Stop in (`isHeardByXcode`:
+  answered, even "nothing to stop"), not when it never got there or Xcode
+  refused the agent.
 - **Results** say what happened (`Launched on …`), never what is (`Running on`
   comes only from a live launch session). A launch that ends is marked
   `App ended`, with who launched it and when it ended; who ended it is unknown.
